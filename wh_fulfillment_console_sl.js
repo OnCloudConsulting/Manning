@@ -249,7 +249,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             const timer = setTimeout(() => controller.abort(), 120000);
             const opt = { method, credentials: 'same-origin', headers: {}, signal: controller.signal };
             if (method === 'POST') {
-                progress(({ release: 'Releasing orders', releaseLines: 'Releasing lines and creating dropship POs', unrelease: 'Returning order to Release', pick: 'Saving picked quantities', pack: 'Saving and checking packages', markPrinted: 'Saving ticket status', shippingCost: 'Requesting and saving shipping cost', label: 'Retrieving shipping labels', labelDownloaded: 'Saving label status', ship: 'Marking shipments shipped' })[action] + '…');
+                progress(({ release: 'Releasing orders', releaseLines: 'Releasing lines and creating POs', unrelease: 'Returning order to Release', pick: 'Saving picked quantities', pack: 'Saving and checking packages', markPrinted: 'Saving ticket status', shippingCost: 'Requesting and saving shipping cost', label: 'Retrieving shipping labels', labelDownloaded: 'Saving label status', ship: 'Marking shipments shipped' })[action] + '…');
                 opt.headers['Content-Type'] = 'application/json';
                 opt.body = JSON.stringify(Object.assign({ action }, body || {}));
             }
@@ -457,7 +457,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             r.lines.forEach((l) => {
                 if (l.dropship || !(l.unreleased > 0)) return;
                 const rq = Math.min(l.releasable, l.unreleased);
-                S.rel[l.lineId] = { r: rq > 0, rq: rq, d: false, dq: Math.max(0, l.unreleased - rq) || l.unreleased };
+                S.rel[l.lineId] = { r: rq > 0, rq: rq, d: false };
             });
         }
 
@@ -465,17 +465,17 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             const lines = []; let sumR = 0, sumD = 0, error = '';
             r.lines.forEach((l) => {
                 const s = S.rel[l.lineId]; if (!s) return;
-                const rq = s.r ? Number(s.rq) : 0;
-                const dq = s.d ? Number(s.dq) : 0;
-                if (!rq && !dq) return;
+                const po = !!s.d;
+                const rq = s.r && !po ? Number(s.rq) : 0;
+                if (!rq && !po) return;
                 if (error) return;
-                if (!Number.isFinite(rq) || !Number.isFinite(dq) || rq < 0 || dq < 0) error = l.sku + ': enter a positive quantity.';
+                if (!Number.isFinite(rq) || rq < 0) error = l.sku + ': enter a positive quantity.';
                 else if (rq > l.releasable) error = l.sku + ': only ' + l.releasable + ' committed and not yet released.';
-                else if (rq + dq > l.unreleased) error = l.sku + ': release + dropship (' + (rq + dq) + ') is more than the ' + l.unreleased + ' open.';
-                else if (dq && l.hasPo) error = l.sku + ': this line already has a PO.';
-                lines.push({ lineId: l.lineId, releaseQty: rq, dropshipQty: dq }); sumR += rq; sumD += dq;
+                else if (rq > l.unreleased) error = l.sku + ': only ' + l.unreleased + ' open and not released.';
+                else if (po && l.hasPo) error = l.sku + ': this line already has a PO.';
+                lines.push({ lineId: l.lineId, releaseQty: rq, createPo: po }); sumR += rq; sumD += po ? 1 : 0;
             });
-            const label = sumR && sumD ? 'Release & create dropship PO' : sumD ? 'Create dropship PO' : 'Release to warehouse';
+            const label = sumR && sumD ? 'Release & create PO' : sumD ? 'Create PO' : 'Release to warehouse';
             return { ok: !error && lines.length > 0, error, lines, label, sumR, sumD };
         }
 
@@ -628,11 +628,11 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                     '<td>' + qtyFmt(l.onHand) + '</td>' +
                     '<td' + (short ? ' class="short"' : '') + '>' + qtyFmt(l.available) + '</td>' +
                     '<td>' + l.releasable + (l.commitQty > l.releasable ? '<div class="whc-sub">of ' + l.commitQty + '</div>' : '') + '</td>' +
-                    '<td><div class="ctl"><input type="checkbox" data-chg="relChk" data-line="' + esc(l.lineId) + '"' + (s.r ? ' checked' : '') + (l.releasable > 0 ? '' : ' disabled') + ' aria-label="Release ' + esc(l.sku) + '">' +
-                        '<input type="number" min="0" step="any" max="' + l.releasable + '" value="' + esc(s.rq) + '" data-chg="relQty" data-line="' + esc(l.lineId) + '"' + (s.r ? '' : ' disabled') + ' aria-label="Release qty ' + esc(l.sku) + '"></div></td>' +
-                    '<td><div class="ctl"><input type="checkbox" data-chg="dsChk" data-line="' + esc(l.lineId) + '"' + (s.d ? ' checked' : '') + (l.hasPo ? ' disabled' : '') + ' aria-label="Dropship ' + esc(l.sku) + '">' +
-                        '<input type="number" min="0" step="any" max="' + l.unreleased + '" value="' + esc(s.dq) + '" data-chg="dsQty" data-line="' + esc(l.lineId) + '"' + (s.d ? '' : ' disabled') + ' aria-label="Dropship qty ' + esc(l.sku) + '"></div>' +
-                        '<div class="whc-sub">' + (l.vendor ? esc(l.vendor) : 'Preferred vendor') + '</div></td>' +
+                    '<td><div class="ctl"><input type="checkbox" data-chg="relChk" data-line="' + esc(l.lineId) + '"' + (s.r && !s.d ? ' checked' : '') + (l.releasable > 0 && !s.d ? '' : ' disabled') + ' aria-label="Release ' + esc(l.sku) + '">' +
+                        '<input type="number" min="0" step="any" max="' + l.releasable + '" value="' + esc(s.rq) + '" data-chg="relQty" data-line="' + esc(l.lineId) + '"' + (s.r && !s.d ? '' : ' disabled') + ' aria-label="Release qty ' + esc(l.sku) + '"></div></td>' +
+                    '<td><div class="ctl"><input type="checkbox" data-chg="dsChk" data-line="' + esc(l.lineId) + '"' + (s.d ? ' checked' : '') + (l.hasPo ? ' disabled' : '') + ' aria-label="Create PO for ' + esc(l.sku) + '">' +
+                        '<span class="whc-sub">' + (l.hasPo ? 'PO exists' : 'Whole line') + '</span></div>' +
+                        '<div class="whc-sub">' + (l.vendor ? esc(l.vendor) : 'Item vendor') + '</div></td>' +
                     '</tr>';
             }).join('');
             const otherHtml = other.map((l) =>
@@ -642,16 +642,16 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
 
             const info = kv([['Customer', esc(r.customer)], ['Channel', esc(r.channel)], ['Ship via', esc(r.shipVia)], ['Order date', esc(r.date)],
                 ['Ship to', esc(r.shipTo).replace(/\r?\n/g, '<br>')]]);
-            const banner = (r.blocked ? '<div class="whc-banner bad">' + esc(r.blocked) + '. Release is blocked; dropship PO is still allowed unless the order is on hold.</div>' : '') +
-                (r.relCommit === 'none' ? '<div class="whc-banner warn">Nothing committed for the open qty. Release what arrives later, or send it to a dropship PO.</div>'
+            const banner = (r.blocked ? '<div class="whc-banner bad">' + esc(r.blocked) + '. Release is blocked; PO creation is still allowed unless the order is on hold.</div>' : '') +
+                (r.relCommit === 'none' ? '<div class="whc-banner warn">Nothing committed for the open qty. Release what arrives later, or create the PO.</div>'
                 : r.relCommit === 'partial' ? '<div class="whc-banner warn">Partial stock: ' + plural(r.relUnits - r.relReady, 'unit') + ' not committed.</div>'
                 : '<div class="whc-banner ok">All open qty is committed.</div>');
 
             return {
                 body: banner + info +
-                    '<h3>Lines <small>Release committed qty to the warehouse, and/or send qty to a dropship PO</small></h3>' +
+                    '<h3>Lines <small>Release committed qty to the warehouse, or create the PO for a Drop Ship / Special Order line</small></h3>' +
                     '<div class="whc-tw"><table class="whc-t whc-lines whc-rel"><thead><tr><th>Item</th><th>Open</th><th>On hand</th><th>Available</th><th>Committed</th>' +
-                    '<th class="grp">Release to warehouse</th><th class="grp">Create dropship PO</th></tr></thead><tbody>' + rowsHtml + otherHtml + '</tbody></table></div>' +
+                    '<th class="grp">Release to warehouse</th><th class="grp">Create PO <small>(Drop Ship / Special Order)</small></th></tr></thead><tbody>' + rowsHtml + otherHtml + '</tbody></table></div>' +
                     '<div id="whc-relerr" class="whc-banner bad" role="alert">' + esc(v.error) + '</div>',
                 foot: '<button type="button" class="whc-btn" data-act="relAll">Check all releasable</button>' +
                     '<button type="button" class="whc-btn primary" data-act="applyRelease" data-k="' + r.id + '" data-busy="' + (v.ok ? 'on' : 'off') + '">' + v.label + '</button>'
@@ -1011,7 +1011,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                 act('releaseLines', { soId: el.dataset.k, lines: v.lines }, (r) => {
                     const parts = [];
                     if (r.released) parts.push('Released ' + r.released + ' units');
-                    if (r.dropship) parts.push('Dropship ' + r.dropship + ' units' + (r.pos && r.pos.length ? ' on ' + r.pos.join(', ') : ''));
+                    if (r.pos && r.pos.length) parts.push('PO ' + r.pos.join(', '));
                     return (r.tranid ? r.tranid + ': ' : '') + parts.join(', ');
                 });
             },
@@ -1070,9 +1070,9 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                 if (k === 'relChk') s.r = el.checked; else s.d = el.checked;
                 renderDrawer();
             }
-            else if (k === 'relQty' || k === 'dsQty') {
+            else if (k === 'relQty') {
                 const s = S.rel[el.dataset.line]; if (!s) return;
-                if (k === 'relQty') s.rq = el.value; else s.dq = el.value;
+                s.rq = el.value;
                 refreshRelease();
             }
             else if (k === 'pickChk') { S.pick[el.dataset.line].check = el.checked; renderDrawer(); }
@@ -1088,7 +1088,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             const k = e.target.dataset.chg;
             if (k === 'q') { S.q = e.target.value; renderList(); renderBulk(); }
             else if (k === 'pickQty' && S.pick[e.target.dataset.line]) { S.pick[e.target.dataset.line].qty = e.target.value; }
-            else if (k === 'relQty' || k === 'dsQty') { e.target.dispatchEvent(new Event('change', { bubbles: true })); }
+            else if (k === 'relQty') { e.target.dispatchEvent(new Event('change', { bubbles: true })); }
             else if (k === 'box') { e.target.dispatchEvent(new Event('change', { bubbles: true })); }
         });
 
