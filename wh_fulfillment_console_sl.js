@@ -4,22 +4,27 @@
  * @NModuleScope SameAccount
  *
  * wh_fulfillment_console_sl.js
- * Warehouse Fulfillment Console: To release -> Ready to pick -> Picked -> Packed -> Shipped
+ * Warehouse Fulfillment Console: Release -> Ready to pick -> Picked -> Packed -> Shipped
  *
  * Routes (same deployment URL)
  *   GET                       page
  *   GET  action=data          board JSON
  *   GET  action=diag          SuiteQL column check (returns only failing columns)
  *   GET  action=ifdetail      item fulfillment detail JSON (&ifid=)
- *   GET  action=ticketpdf     picking tickets PDF (&ids=1,2,3)
+ *   GET  action=ticketpdf     picking tickets PDF (&ids=1,2,3), released qty only
  *   GET  action=packslip      native packing slip PDF (&so=&if=)
- *   POST {action, ...}        release | unrelease | markPrinted | pick | pack | label | labelDownloaded | ship
+ *   POST {action, ...}        release | releaseLines | unrelease | markPrinted | pick | pack |
+ *                             shippingCost | label | labelDownloaded | ship
  *
  * Script parameters
- *   custscript_whc_location      List/Record (Location)  warehouse location filter (optional)
- *   custscript_whc_shipped_days  Integer                 days of shipped history (default 2)
- *   custscript_whc_label_url     Free-Form Text          label page template, {ifid} or {ifids} (optional;
- *                                                        default opens the Item Fulfillment record)
+ *   custscript_whc_location       List/Record (Location)   warehouse location filter (optional)
+ *   custscript_whc_shipped_days   Integer                  days of shipped history (default 2)
+ *   custscript_whc_label_url      Free-Form Text           label page template (optional)
+ *
+ * Release (wh_fulfillment_lib.js)
+ *   Who: Administrator role, or employees with custentity_whc_release_access checked.
+ *   Each line can be partly released to the warehouse (custcol_whc_release_qty) and partly sent to a
+ *   dropship PO. Ready to pick, picking tickets and pick validation use the released qty.
  */
 define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_lib', 'N/file'],
 (serverWidget, runtime, url, log, lib, file) => {
@@ -30,15 +35,16 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
     };
 
     const POST_ACTIONS = {
-        release:     (b) => lib.release(b.soIds),
-        unrelease:   (b) => lib.unrelease(b.soId),
-        markPrinted: (b) => lib.markPrinted(b.soIds),
-        pick:        (b) => lib.pick(b.soId, b.lines),
-        pack:        (b) => lib.pack(b.ifId, b.packages),
-        shippingCost: (b, req) => lib.calculateShippingCost(b.ifId, req.headers),
-        label:       (b) => lib.printLabel(b.ifIds),
+        release:         (b) => lib.release(b.soIds),
+        releaseLines:    (b) => lib.releaseLines(b.soId, b.lines),
+        unrelease:       (b) => lib.unrelease(b.soId),
+        markPrinted:     (b) => lib.markPrinted(b.soIds),
+        pick:            (b) => lib.pick(b.soId, b.lines),
+        pack:            (b) => lib.pack(b.ifId, b.packages),
+        shippingCost:    (b, req) => lib.calculateShippingCost(b.ifId, req.headers),
+        label:           (b) => lib.printLabel(b.ifIds),
         labelDownloaded: (b) => lib.labelDownloaded(b.ifId, b.zpl),
-        ship:        (b) => lib.ship(b.ifIds)
+        ship:            (b) => lib.ship(b.ifIds)
     };
 
     function onRequest(ctx) {
@@ -61,7 +67,6 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                         res.setHeader({ name: 'Cache-Control', value: 'private, max-age=3600' });
                         return res.write({ output: file.load({ id: './wh_zpl_renderer.js' }).getContents() });
                     case 'labelworker': {
-                        const script = runtime.getCurrentScript();
                         const rendererUrl = file.load({ id: './wh_zpl_renderer.js' }).url;
                         res.setHeader({ name: 'Content-Type', value: 'application/javascript; charset=UTF-8' });
                         return res.write({ output: 'import { ready } from ' + JSON.stringify(rendererUrl) + ';' +
@@ -113,7 +118,8 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
         const cfg = {
             url: url.resolveScript({ scriptId: script.id, deploymentId: script.deploymentId }),
             soUrl: '/app/accounting/transactions/salesord.nl?id=',
-            ifUrl: '/app/accounting/transactions/itemship.nl?id='
+            ifUrl: '/app/accounting/transactions/itemship.nl?id=',
+            canRelease: lib.canRelease()
         };
         const safeCfg = JSON.stringify(cfg).replace(/<\/script>/gi, '<\\/script>');
 
@@ -177,26 +183,31 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
 #whc #whc-overlay{display:none;position:fixed;inset:0;background:rgba(23,34,50,.3);z-index:2000;justify-content:flex-end}#whc #whc-overlay.open{display:flex}
 #whc #whc-drawer{width:min(700px,100%);height:100vh;background:#fff;display:flex;flex-direction:column;box-shadow:-8px 0 32px rgba(20,30,45,.12)}
 #whc .whc-dh{display:flex;gap:16px;align-items:center;padding:22px 24px;border-bottom:1px solid var(--line)}#whc .whc-dh h2{margin:0;font-size:21px;font-weight:600}#whc .whc-dh .whc-btn{margin-left:auto}
-#whc #whc-derror:not(:empty){padding:12px 24px 0;max-height:35vh;overflow:auto;flex-shrink:0}#whc #whc-derror .whc-banner{margin:0}\n#whc .whc-db{flex:1;overflow:auto;padding:24px;min-height:0}#whc .whc-df{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;padding:16px 24px;border-top:1px solid var(--line);background:#fafbfc}
+#whc #whc-derror:not(:empty){padding:12px 24px 0;max-height:35vh;overflow:auto;flex-shrink:0}#whc #whc-derror .whc-banner{margin:0}
+#whc .whc-db{flex:1;overflow:auto;padding:24px;min-height:0}#whc .whc-df{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;padding:16px 24px;border-top:1px solid var(--line);background:#fafbfc}
 #whc .whc-kv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px 24px;margin:4px 0 28px}#whc .whc-kv>div{overflow-wrap:anywhere}#whc .whc-kv span{display:block;color:var(--muted);font-size:11px;margin-bottom:4px}
 #whc .whc-banner{border-radius:5px;padding:10px 12px;margin-bottom:22px;font-size:12px}#whc .whc-banner.warn{background:var(--warn-bg);color:var(--warn-ink)}#whc .whc-banner.ok{background:var(--ok-bg);color:var(--ok-ink)}#whc .whc-banner.bad{background:var(--bad-bg);color:var(--bad-ink)}
 #whc h3{font-size:13px;font-weight:600;margin:24px 0 12px}#whc .whc-lines th,#whc .whc-lines td{padding:10px}#whc .whc-lines input[type=number]{width:72px;border:1px solid var(--line);border-radius:4px;padding:6px}#whc .whc-lines tr.ds td{color:var(--muted)}
 #whc .whc-pkg{display:grid;grid-template-columns:20px 110px 1fr 32px;gap:8px;align-items:center;margin-bottom:10px}#whc .whc-pkg input{border:1px solid var(--line);border-radius:5px;padding:9px;width:100%;min-width:0}
 #whc #whc-toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2100;display:none;background:var(--ink);color:#fff;padding:12px 20px;border-radius:6px;max-width:90%;box-shadow:0 4px 20px #0002}#whc #whc-toast.show{display:block}#whc #whc-toast.err{background:#a43b3b}
 #whc :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
-@media(max-width:760px){#whc{padding:12px 8px}#whc .whc-stage{padding:12px 10px;gap:6px}#whc .whc-toolbar{padding:12px}#whc .whc-toolbar input{width:100%;flex-basis:100%}#whc .whc-sp{display:none}#whc #whc-bulk{margin-left:auto}#whc #whc-derror:not(:empty){padding:12px 24px 0;max-height:35vh;overflow:auto;flex-shrink:0}#whc #whc-derror .whc-banner{margin:0}\n#whc .whc-db{padding:16px}#whc .whc-dh{padding:16px}#whc .whc-df{padding:12px 16px}#whc .whc-pkg{grid-template-columns:18px 85px 1fr 28px}}
+@media(max-width:760px){#whc{padding:12px 8px}#whc .whc-stage{padding:12px 10px;gap:6px}#whc .whc-toolbar{padding:12px}#whc .whc-toolbar input{width:100%;flex-basis:100%}#whc .whc-sp{display:none}#whc #whc-bulk{margin-left:auto}#whc .whc-db{padding:16px}#whc .whc-dh{padding:16px}#whc .whc-df{padding:12px 16px}#whc .whc-pkg{grid-template-columns:18px 85px 1fr 28px}}
 #whc{--accent:#126964;--bg2:#eef5f5;--muted:#526878}
 #whc .whc-rail{gap:4px;padding:5px;background:#eaf2f3;border:1px solid #d6e4e5;border-radius:12px;width:fit-content;max-width:100%}
 #whc .whc-stage{border:0;border-radius:8px}#whc .whc-stage[aria-selected=true]{background:#135951;color:white}#whc .whc-stage[aria-selected=true] .n{background:#d9f1e9;color:#15594f}
 #whc .whc-panel{border-radius:12px}#whc .whc-toolbar{padding:14px;background:#f8fbfb}
-#whc #whc-overlay{position:fixed;inset:0;margin:auto;padding:0;border:0;width:min(840px,94vw);max-width:94vw;height:fit-content;max-height:90vh;background:white;border-radius:15px;box-shadow:0 18px 85px #10374455}
+#whc #whc-overlay{position:fixed;inset:0;margin:auto;padding:0;border:0;width:min(1080px,96vw);max-width:96vw;height:fit-content;max-height:90vh;background:white;border-radius:15px;box-shadow:0 18px 85px #10374455}
 #whc #whc-overlay[open]{display:block}#whc #whc-overlay::backdrop{background:#16303d77}
 #whc #whc-drawer{width:100%;height:auto;max-height:90vh;box-shadow:none}
 #whc .whc-dh{background:#e8f4f0;border-top:4px solid #187968}#whc .whc-kv{padding:14px 18px;background:#f6f9fa;border-radius:8px;gap:10px 20px}
 #whc .whc-dims{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px}
 #whc .whc-dims label{text-transform:capitalize;font-weight:600;color:#324e5b}#whc .whc-dims input{display:block;width:100%;padding:8px;margin-top:4px;border:1px solid #bfcfd2;border-radius:5px}
 #whc h3 small{font-weight:400;color:#526878}#whc-progress{padding:10px 16px;background:#e0f3ed;color:#124e43;font-weight:600}#whc-progress progress{display:block;width:100%;height:5px;accent-color:#107667;margin-top:4px}
-
+#whc .whc-rel td{white-space:nowrap}#whc .whc-rel td.item{white-space:normal;min-width:180px}
+#whc .whc-rel .ctl{display:flex;align-items:center;gap:6px}#whc .whc-rel .ctl input[type=number]{width:70px}
+#whc .whc-rel th.grp{background:#e3efee;color:#174f49;text-align:center}
+#whc .whc-rel td.short{color:var(--bad-ink);font-weight:600}
+#whc #whc-relerr:not(:empty){margin-top:12px}#whc #whc-relerr:empty{display:none}
 `;
 
     /* ================================================================== */
@@ -207,34 +218,38 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
         'use strict';
         const CFG = JSON.parse(document.getElementById('whc-config').textContent);
         const STAGES = [
-            { id: 'release', t: 'Release',    s: 'Manager reviews commitment' },
+            { id: 'release', t: 'Release',       s: 'Manager reviews commitment' },
             { id: 'ready',   t: 'Ready to Pick', s: 'Released, not yet picked' },
             { id: 'picked',  t: 'Picked',        s: 'Fulfillment status Picked' },
             { id: 'packed',  t: 'Packed',        s: 'Boxed and weighed, needs label' },
             { id: 'shipped', t: 'Shipped',       s: 'Recently shipped' }
         ];
+        const VISIBLE = STAGES.filter((s) => CFG.canRelease || s.id !== 'release');
         const ORDER_TABS = { release: 1, ready: 1 };
-        const S = { costs: {}, tab: 'release', board: null, sel: new Set(), q: '', ch: 'all', cm: 'all', drawer: null, detail: null, pick: {}, pkgs: [], dims: {}, workflow: 'all', busy: false };
+        const S = { costs: {}, tab: VISIBLE[0].id, board: null, sel: new Set(), q: '', ch: 'all', cm: 'all', drawer: null, detail: null, pick: {}, rel: {}, pkgs: [], dims: {}, workflow: 'all', busy: false };
         const root = document.getElementById('whc');
         const $ = (id) => document.getElementById(id);
         const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
         const plural = (n, w) => n + ' ' + w + (n === 1 ? '' : 's');
+        const qtyFmt = (v) => (v === null || v === undefined || v === '') ? '\u2013' : Number(v).toLocaleString();
 
         /* ---------- server ---------- */
         function progress(message) {
-            let box=$('whc-progress');
-            if(!message){if(box)box.remove();return;}
-            if(!box){box=document.createElement('div');box.id='whc-progress';box.setAttribute('role','status');
-                box.innerHTML='<span></span><progress aria-label="Working"></progress>';}
-            const host=root.querySelector('dialog[open]:last-of-type:not(#whc-overlay)') || (S.drawer ? $('whc-drawer') : root);
-            host.prepend(box);box.firstChild.textContent=message;
+            let box = $('whc-progress');
+            if (!message) { if (box) box.remove(); return; }
+            if (!box) {
+                box = document.createElement('div'); box.id = 'whc-progress'; box.setAttribute('role', 'status');
+                box.innerHTML = '<span></span><progress aria-label="Working"></progress>';
+            }
+            const host = root.querySelector('dialog[open]:last-of-type:not(#whc-overlay)') || (S.drawer ? $('whc-drawer') : root);
+            host.prepend(box); box.firstChild.textContent = message;
         }
         function api(method, action, body, qs) {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), 120000);
             const opt = { method, credentials: 'same-origin', headers: {}, signal: controller.signal };
             if (method === 'POST') {
-                progress(({release:'Releasing orders',unrelease:'Returning order to Release',pick:'Saving picked quantities',pack:'Saving and checking packages',markPrinted:'Saving ticket status',shippingCost:'Requesting and saving shipping cost',label:'Retrieving shipping labels',labelDownloaded:'Saving label status',ship:'Marking shipments shipped'})[action]+'…');
+                progress(({ release: 'Releasing orders', releaseLines: 'Releasing lines and creating dropship POs', unrelease: 'Returning order to Release', pick: 'Saving picked quantities', pack: 'Saving and checking packages', markPrinted: 'Saving ticket status', shippingCost: 'Requesting and saving shipping cost', label: 'Retrieving shipping labels', labelDownloaded: 'Saving label status', ship: 'Marking shipments shipped' })[action] + '…');
                 opt.headers['Content-Type'] = 'application/json';
                 opt.body = JSON.stringify(Object.assign({ action }, body || {}));
             }
@@ -250,7 +265,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
         }
 
         function load(keepDrawer) {
-            if(S.busy) progress('Refreshing orders…');
+            if (S.busy) progress('Refreshing orders…');
             return api('GET', 'data').then((b) => {
                 S.board = b; S.costs = {};
                 if (!keepDrawer) closeDrawer();
@@ -267,7 +282,9 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                 .then((r) => {
                     if (r.skipped && r.skipped.length) {
                         const keep = S.drawer;
+                        const msg = typeof okMsg === 'function' ? okMsg(r) : okMsg;
                         return load(true).then(() => keep ? openDrawer(keep) : null).then(() => {
+                            if (msg) toast(msg);
                             showError(r.skipped.map((item) => item.reason || 'Action skipped.').join(' '));
                         });
                     }
@@ -393,7 +410,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
         }
 
         function renderBusy() {
-            if(!S.busy) progress('');
+            if (!S.busy) progress('');
             root.querySelectorAll('[data-busy]').forEach((b) => { b.disabled = S.busy || b.dataset.busy === 'off'; });
         }
 
@@ -401,7 +418,8 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
         const keyOf = (r) => String(r.ifId || r.id);
         const findRow = (k) => {
             const b = S.board; if (!b) return null;
-            for (const s of STAGES) { const r = b[s.id].find((x) => keyOf(x) === String(k)); if (r) return { row: r, stage: s.id }; }
+            const order = [S.tab].concat(STAGES.map((s) => s.id).filter((id) => id !== S.tab));
+            for (const id of order) { const r = (b[id] || []).find((x) => keyOf(x) === String(k)); if (r) return { row: r, stage: id }; }
             return null;
         };
         function commitPill(c) {
@@ -414,31 +432,69 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             if (o.awaitingPo) h += '<div class="whc-sub">' + plural(o.awaitingPo, 'dropship line') + ' awaiting PO</div>';
             return h;
         }
-        const axes=['length','width','height'];
-        function newBox(){return {weight:'',descr:'',dimensions:{}};}
-        function resetBox(){S.box=newBox();S.editBox=-1;S.boxDirty=false;}
-        function validBox(p){return Number(p.weight)>0 && (S.detail.packageSublist!=='packagefedex' || axes.every(k=>Number((p.dimensions||{})[k])>0));}
-        function packReady(){return !S.boxDirty && S.pkgs.length && S.pkgs.every(validBox);}
-        function boxList(packages,edit){
-            if(!packages.length)return '';
-            return '<div class="whc-tw"><table class="whc-t"><thead><tr><th>Box</th><th>Weight</th><th>Dimensions (L × W × H)</th>'+(edit?'<th></th>':'')+'</tr></thead><tbody>'+packages.map((p,i)=>
-               '<tr><td>'+ (i+1) +'</td><td>'+esc(p.weight)+' lb</td><td>'+(axes.every(k=>Number((p.dimensions||{})[k])>0)?axes.map(k=>esc(p.dimensions[k])).join(' × ')+' in':'—')+'</td>'+(edit?'<td><button type="button" class="whc-btn" data-act="editPkg" data-i="'+i+'">Edit box '+(i+1)+'</button> <button type="button" class="whc-btn link" data-act="rmPkg" data-i="'+i+'">Remove</button></td>':'')+'</tr>').join('')+'</tbody></table></div>';
+        const axes = ['length', 'width', 'height'];
+        function newBox() { return { weight: '', descr: '', dimensions: {} }; }
+        function resetBox() { S.box = newBox(); S.editBox = -1; S.boxDirty = false; }
+        function validBox(p) { return Number(p.weight) > 0 && (S.detail.packageSublist !== 'packagefedex' || axes.every(k => Number((p.dimensions || {})[k]) > 0)); }
+        function packReady() { return !S.boxDirty && S.pkgs.length && S.pkgs.every(validBox); }
+        function boxList(packages, edit) {
+            if (!packages.length) return '';
+            return '<div class="whc-tw"><table class="whc-t"><thead><tr><th>Box</th><th>Weight</th><th>Dimensions (L × W × H)</th>' + (edit ? '<th></th>' : '') + '</tr></thead><tbody>' + packages.map((p, i) =>
+                '<tr><td>' + (i + 1) + '</td><td>' + esc(p.weight) + ' lb</td><td>' + (axes.every(k => Number((p.dimensions || {})[k]) > 0) ? axes.map(k => esc(p.dimensions[k])).join(' × ') + ' in' : '—') + '</td>' + (edit ? '<td><button type="button" class="whc-btn" data-act="editPkg" data-i="' + i + '">Edit box ' + (i + 1) + '</button> <button type="button" class="whc-btn link" data-act="rmPkg" data-i="' + i + '">Remove</button></td>' : '') + '</tr>').join('') + '</tbody></table></div>';
         }
         function rows() {
             const q = S.q.trim().toLowerCase();
             return (S.board[S.tab] || [])
                 .filter((r) => S.ch === 'all' || r.channel === S.ch)
-                .filter((r) => S.tab !== 'release' || S.cm === 'all' || r.commit === S.cm)
-                .filter(r=> S.workflow==='all' || (S.tab==='packed' ? !!r.labelPrinted : !!r.printed) === (S.workflow==='yes'))
+                .filter((r) => S.tab !== 'release' || S.cm === 'all' || r.relCommit === S.cm)
+                .filter(r => S.workflow === 'all' || (S.tab === 'packed' ? !!r.labelPrinted : !!r.printed) === (S.workflow === 'yes'))
                 .filter((r) => !q || [r.tranid, r.soNum, r.ifNum, r.customer, r.channel].join(' ').toLowerCase().indexOf(q) > -1);
+        }
+
+        /* ---------- release (line level) ---------- */
+        function initRelease(r) {
+            S.rel = {};
+            r.lines.forEach((l) => {
+                if (l.dropship || !(l.unreleased > 0)) return;
+                const rq = Math.min(l.releasable, l.unreleased);
+                S.rel[l.lineId] = { r: rq > 0, rq: rq, d: false, dq: Math.max(0, l.unreleased - rq) || l.unreleased };
+            });
+        }
+
+        function relCheck(r) {
+            const lines = []; let sumR = 0, sumD = 0, error = '';
+            r.lines.forEach((l) => {
+                const s = S.rel[l.lineId]; if (!s) return;
+                const rq = s.r ? Number(s.rq) : 0;
+                const dq = s.d ? Number(s.dq) : 0;
+                if (!rq && !dq) return;
+                if (error) return;
+                if (!Number.isFinite(rq) || !Number.isFinite(dq) || rq < 0 || dq < 0) error = l.sku + ': enter a positive quantity.';
+                else if (rq > l.releasable) error = l.sku + ': only ' + l.releasable + ' committed and not yet released.';
+                else if (rq + dq > l.unreleased) error = l.sku + ': release + dropship (' + (rq + dq) + ') is more than the ' + l.unreleased + ' open.';
+                else if (dq && l.hasPo) error = l.sku + ': this line already has a PO.';
+                lines.push({ lineId: l.lineId, releaseQty: rq, dropshipQty: dq }); sumR += rq; sumD += dq;
+            });
+            const label = sumR && sumD ? 'Release & create dropship PO' : sumD ? 'Create dropship PO' : 'Release to warehouse';
+            return { ok: !error && lines.length > 0, error, lines, label, sumR, sumD };
+        }
+
+        function refreshRelease() {
+            const f = findRow(S.drawer); if (!f || f.stage !== 'release') return;
+            const v = relCheck(f.row);
+            const btn = root.querySelector('[data-act="applyRelease"]');
+            if (btn) { btn.dataset.busy = v.ok ? 'on' : 'off'; btn.textContent = v.label; }
+            const err = $('whc-relerr'); if (err) err.textContent = v.error;
+            renderBusy();
         }
 
         /* ---------- list ---------- */
         function render() {
             const b = S.board;
-            $('whc-rail').innerHTML = STAGES.map((s, i) =>
+            if (!VISIBLE.some((s) => s.id === S.tab)) S.tab = VISIBLE[0].id;
+            $('whc-rail').innerHTML = VISIBLE.map((s) =>
                 '<button type="button" role="tab" class="whc-stage" data-s="' + s.id + '" data-act="tab" data-k="' + s.id + '" aria-selected="' + (S.tab === s.id) + '">' +
-                '<span class="t">' + s.t + '</span><span class="n">' + b[s.id].length + '</span></button>'
+                '<span class="t">' + s.t + '</span><span class="n">' + (b[s.id] || []).length + '</span></button>'
             ).join('');
             renderToolbar();
             renderList();
@@ -454,7 +510,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                 h += '<select data-chg="cm" aria-label="Commitment">' + opt('all', S.cm, 'Any commitment') + opt('full', S.cm, 'Committed') +
                     opt('partial', S.cm, 'Partially committed') + opt('none', S.cm, 'Not committed') + '</select>';
             }
-            if(t==='packed'||t==='ready') h+='<select aria-label="Workflow status" data-chg="workflow">'+opt('all',S.workflow,'All statuses')+opt('yes',S.workflow,t==='packed'?'Label ready':'Ticket printed')+opt('no',S.workflow,t==='packed'?'Needs label':'Needs ticket')+'</select>';
+            if (t === 'packed' || t === 'ready') h += '<select aria-label="Workflow status" data-chg="workflow">' + opt('all', S.workflow, 'All statuses') + opt('yes', S.workflow, t === 'packed' ? 'Label ready' : 'Ticket printed') + opt('no', S.workflow, t === 'packed' ? 'Needs label' : 'Needs ticket') + '</select>';
             h += '<span class="whc-sp"></span><button type="button" class="whc-btn" data-act="refresh">Refresh</button><span id="whc-bulk"></span>';
             $('whc-toolbar').innerHTML = h;
             renderBulk();
@@ -469,8 +525,8 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             const sel = selected(), t = S.tab;
             let h = '';
             if (t === 'release') {
-                const n = sel.filter((k) => findRow(k).row.commit !== 'none' && !findRow(k).row.blocked).length;
-                h = '<button type="button" class="whc-btn primary" data-act="releaseSel" data-busy="' + (n ? 'on' : 'off') + '">Release' + (n ? ' (' + n + ')' : '') + '</button>';
+                const n = sel.filter((k) => findRow(k).row.relCommit !== 'none' && !findRow(k).row.blocked).length;
+                h = '<button type="button" class="whc-btn primary" data-act="releaseSel" data-busy="' + (n ? 'on' : 'off') + '" title="Releases all committed qty on the selected orders">Release committed' + (n ? ' (' + n + ')' : '') + '</button>';
             } else if (t === 'ready') {
                 h = '<button type="button" class="whc-btn primary" data-act="ticketsSel" data-busy="' + (sel.length ? 'on' : 'off') + '">Print tickets' + (sel.length ? ' (' + sel.length + ')' : '') + '</button>';
             } else if (t === 'packed') {
@@ -486,7 +542,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             const t = S.tab, list = rows();
             const hasCb = t === 'release' || t === 'ready' || t === 'packed';
             const head = {
-                release: ['Order', 'Channel', 'Date', 'Customer', 'Ship via', 'Open lines', 'Commitment'],
+                release: ['Order', 'Channel', 'Date', 'Customer', 'Ship via', 'To release', 'Commitment'],
                 ready:   ['Order', 'Channel', 'Released', 'Customer', 'Ship via', 'To pick', 'Picking ticket'],
                 picked:  ['Fulfillment', 'Channel', 'Order', 'Customer', 'Ship via', 'Date', 'Lines'],
                 packed:  ['Fulfillment', 'Channel', 'Order', 'Customer', 'Ship via', 'Shipping cost', 'Date', 'Label'],
@@ -508,11 +564,12 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                 let c = [];
                 if (t === 'release') {
                     c = ['<strong>' + esc(r.tranid) + '</strong><div class="whc-sub">' + esc(r.status) + '</div>', esc(r.channel), esc(r.date), esc(r.customer), esc(r.shipVia),
-                        plural(r.openLines, 'line') + ', ' + r.openUnits + ' units' + dsNote(r), (r.blocked ? '<span class="pill bad">' + esc(r.blocked) + '</span>' : commitPill(r.commit))];
+                        plural(r.relLines, 'line') + ', ' + r.relUnits + ' units' + (r.releasedUnits ? '<div class="whc-sub">' + r.releasedUnits + ' already released</div>' : ''),
+                        r.blocked ? '<span class="pill bad">' + esc(r.blocked) + '</span>' : commitPill(r.relCommit)];
                 } else if (t === 'ready') {
                     c = ['<strong>' + esc(r.tranid) + '</strong><div class="whc-sub">' + esc(r.status) + '</div>', esc(r.channel),
                         esc(r.releasedOn) + '<div class="whc-sub">' + esc(r.releasedBy) + '</div>', esc(r.customer), esc(r.shipVia),
-                        r.pickUnits + ' units, ' + plural(r.pickLines, 'line') + (r.commit === 'partial' ? '<div class="whc-sub">Partially committed</div>' : '') + dsNote(r),
+                        r.pickUnits + ' units, ' + plural(r.pickLines, 'line') + (r.commit === 'partial' ? '<div class="whc-sub">Partially released</div>' : '') + dsNote(r),
                         r.printed ? '<span class="pill warn">Printed ' + esc(r.printedOn) + ' by ' + esc(r.printedBy) + (r.printCount > 1 ? ' (x' + r.printCount + ')' : '') + '</span>' : '<span class="pill no">Not printed</span>'];
                 } else {
                     const last = t === 'picked' ? plural(r.lines.length, 'line') + ', ' + r.units + ' units'
@@ -539,14 +596,15 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                 S.pick = {};
                 f.row.lines.forEach((l) => { if (!l.dropship && l.committed > 0) S.pick[l.lineId] = { check: false, qty: l.committed }; });
             }
+            if (f.stage === 'release') initRelease(f.row);
             if (!$('whc-overlay').open) $('whc-overlay').showModal();
             renderDrawer();
             if (!ORDER_TABS[f.stage]) {
                 return api('GET', 'ifdetail', null, '&ifid=' + encodeURIComponent(f.row.ifId)).then((d) => {
                     if (S.drawer !== k) return;
-                    S.detail=d; resetBox();
-                    S.pkgs=d.packages.filter(p=>Number(p.weight)>0 || p.tracking || p.descr || Object.values(p.dimensions||{}).some(Boolean));
-                    if(S.pkgs.length===1 && !validBox(S.pkgs[0])){S.editBox=0;S.box=JSON.parse(JSON.stringify(S.pkgs[0]));}
+                    S.detail = d; resetBox();
+                    S.pkgs = d.packages.filter(p => Number(p.weight) > 0 || p.tracking || p.descr || Object.values(p.dimensions || {}).some(Boolean));
+                    if (S.pkgs.length === 1 && !validBox(S.pkgs[0])) { S.editBox = 0; S.box = JSON.parse(JSON.stringify(S.pkgs[0])); }
                     renderDrawer();
                 }).catch((e) => toast(e.message, true));
             }
@@ -555,6 +613,49 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
 
         function kv(pairs) {
             return '<div class="whc-kv">' + pairs.filter((p) => p[1] !== undefined && p[1] !== '').map((p) => '<div><span>' + p[0] + '</span>' + p[1] + '</div>').join('') + '</div>';
+        }
+
+        function releaseBody(r) {
+            const open = r.lines.filter((l) => !l.dropship && l.unreleased > 0);
+            const other = r.lines.filter((l) => l.dropship || !(l.unreleased > 0));
+            const v = relCheck(r);
+            const rowsHtml = open.map((l) => {
+                const s = S.rel[l.lineId];
+                const short = l.available !== null && l.available !== undefined && l.available < l.unreleased;
+                return '<tr>' +
+                    '<td class="item">' + esc(l.name) + '<div class="whc-sub">' + esc(l.sku) + '</div></td>' +
+                    '<td>' + l.unreleased + (l.released ? '<div class="whc-sub">' + l.released + ' released</div>' : '') + '</td>' +
+                    '<td>' + qtyFmt(l.onHand) + '</td>' +
+                    '<td' + (short ? ' class="short"' : '') + '>' + qtyFmt(l.available) + '</td>' +
+                    '<td>' + l.releasable + (l.commitQty > l.releasable ? '<div class="whc-sub">of ' + l.commitQty + '</div>' : '') + '</td>' +
+                    '<td><div class="ctl"><input type="checkbox" data-chg="relChk" data-line="' + esc(l.lineId) + '"' + (s.r ? ' checked' : '') + (l.releasable > 0 ? '' : ' disabled') + ' aria-label="Release ' + esc(l.sku) + '">' +
+                        '<input type="number" min="0" step="any" max="' + l.releasable + '" value="' + esc(s.rq) + '" data-chg="relQty" data-line="' + esc(l.lineId) + '"' + (s.r ? '' : ' disabled') + ' aria-label="Release qty ' + esc(l.sku) + '"></div></td>' +
+                    '<td><div class="ctl"><input type="checkbox" data-chg="dsChk" data-line="' + esc(l.lineId) + '"' + (s.d ? ' checked' : '') + (l.hasPo ? ' disabled' : '') + ' aria-label="Dropship ' + esc(l.sku) + '">' +
+                        '<input type="number" min="0" step="any" max="' + l.unreleased + '" value="' + esc(s.dq) + '" data-chg="dsQty" data-line="' + esc(l.lineId) + '"' + (s.d ? '' : ' disabled') + ' aria-label="Dropship qty ' + esc(l.sku) + '"></div>' +
+                        '<div class="whc-sub">' + (l.vendor ? esc(l.vendor) : 'Preferred vendor') + '</div></td>' +
+                    '</tr>';
+            }).join('');
+            const otherHtml = other.map((l) =>
+                '<tr class="ds"><td class="item">' + esc(l.name) + '<div class="whc-sub">' + esc(l.sku) + '</div></td><td colspan="6">' +
+                (l.dropship ? 'Dropship' + (l.po ? ', ' + esc(l.po) : '') + ' \u00b7 excluded'
+                    : (l.remaining ? 'Fully released (' + l.released + ')' : 'Closed')) + '</td></tr>').join('');
+
+            const info = kv([['Customer', esc(r.customer)], ['Channel', esc(r.channel)], ['Ship via', esc(r.shipVia)], ['Order date', esc(r.date)],
+                ['Ship to', esc(r.shipTo).replace(/\r?\n/g, '<br>')]]);
+            const banner = (r.blocked ? '<div class="whc-banner bad">' + esc(r.blocked) + '. Release is blocked; dropship PO is still allowed unless the order is on hold.</div>' : '') +
+                (r.relCommit === 'none' ? '<div class="whc-banner warn">Nothing committed for the open qty. Release what arrives later, or send it to a dropship PO.</div>'
+                : r.relCommit === 'partial' ? '<div class="whc-banner warn">Partial stock: ' + plural(r.relUnits - r.relReady, 'unit') + ' not committed.</div>'
+                : '<div class="whc-banner ok">All open qty is committed.</div>');
+
+            return {
+                body: banner + info +
+                    '<h3>Lines <small>Release committed qty to the warehouse, and/or send qty to a dropship PO</small></h3>' +
+                    '<div class="whc-tw"><table class="whc-t whc-lines whc-rel"><thead><tr><th>Item</th><th>Open</th><th>On hand</th><th>Available</th><th>Committed</th>' +
+                    '<th class="grp">Release to warehouse</th><th class="grp">Create dropship PO</th></tr></thead><tbody>' + rowsHtml + otherHtml + '</tbody></table></div>' +
+                    '<div id="whc-relerr" class="whc-banner bad" role="alert">' + esc(v.error) + '</div>',
+                foot: '<button type="button" class="whc-btn" data-act="relAll">Check all releasable</button>' +
+                    '<button type="button" class="whc-btn primary" data-act="applyRelease" data-k="' + r.id + '" data-busy="' + (v.ok ? 'on' : 'off') + '">' + v.label + '</button>'
+            };
         }
 
         function renderDrawer() {
@@ -571,36 +672,27 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                     ['Ship to', esc(r.shipTo).replace(/\r?\n/g, '<br>')]]);
 
                 if (st === 'release') {
-                    const short = r.openUnits - r.pickUnits;
-                    body = (r.blocked ? '<div class="whc-banner bad">' + esc(r.blocked) + '</div>' : '') + (r.commit === 'none' ? '<div class="whc-banner warn">No committed inventory.</div>'
-                        : r.commit === 'partial' ? '<div class="whc-banner warn">Partial stock: ' + plural(short, 'unit') + ' on backorder.</div>'
-                        : '<div class="whc-banner ok">Ready to release.</div>') + info +
-                        '<h3>Lines</h3><div class="whc-tw"><table class="whc-t whc-lines"><thead><tr><th>Item</th><th>Ordered</th><th>Fulfilled</th><th>Remaining</th><th>Committed</th></tr></thead><tbody>' +
-                        r.lines.map((l) => l.dropship
-                            ? '<tr class="ds"><td>' + esc(l.name) + '<div class="whc-sub">' + esc(l.sku) + '</div></td><td>' + l.qty + '</td><td colspan="3">' + (l.po ? 'Dropship, ' + esc(l.po) + ' · excluded' : 'Dropship · awaiting PO') + '</td></tr>'
-                            : '<tr' + (l.remaining ? '' : ' class="ds"') + '><td>' + esc(l.name) + '<div class="whc-sub">' + esc(l.sku) + '</div></td><td>' + l.qty + '</td><td>' + l.fulfilled + '</td><td>' + l.remaining + '</td><td>' +
-                              (!l.remaining ? 'Closed' : l.committed >= l.remaining ? l.committed : l.committed + ' <span class="whc-sub">of ' + l.remaining + '</span>') + '</td></tr>'
-                        ).join('') + '</tbody></table></div>';
-                    foot = '<button type="button" class="whc-btn primary" data-act="releaseOne" data-k="' + r.id + '" data-busy="' + (r.commit === 'none' || r.blocked ? 'off' : 'on') + '">Release</button>';
+                    const out = releaseBody(r);
+                    body = out.body; foot = out.foot;
                 } else {
                     const anyChecked = Object.values(S.pick).some((p) => p.check && Number(p.qty) > 0);
                     const dis = r.printed ? '' : ' disabled';
                     body = (r.printed
                         ? '<div class="whc-banner ok">Picking ticket printed ' + esc(r.printedOn) + ' by ' + esc(r.printedBy) + (r.printCount > 1 ? ', ' + r.printCount + ' times' : '') + '.</div>'
                         : '<div class="whc-banner warn">Print a ticket to begin picking.</div>') + info +
-                        '<h3>Items to pick</h3><div class="whc-tw"><table class="whc-t whc-lines"><thead><tr><th>Picked</th><th>Bin</th><th>Item</th><th>Committed</th><th>Qty picked</th></tr></thead><tbody>' +
+                        '<h3>Items to pick</h3><div class="whc-tw"><table class="whc-t whc-lines"><thead><tr><th>Picked</th><th>Bin</th><th>Item</th><th>Released</th><th>Qty picked</th></tr></thead><tbody>' +
                         r.lines.filter((l) => !l.dropship && l.remaining > 0).map((l) => {
                             const p = S.pick[l.lineId];
-                            if (!p) return '<tr class="ds"><td>\u2013</td><td>' + esc(l.bin || '') + '</td><td>' + esc(l.name) + '<div class="whc-sub">' + esc(l.sku) + '</div></td><td colspan="2">Backordered</td></tr>';
+                            if (!p) return '<tr class="ds"><td>\u2013</td><td>' + esc(l.bin || '') + '</td><td>' + esc(l.name) + '<div class="whc-sub">' + esc(l.sku) + '</div></td><td colspan="2">Not released</td></tr>';
                             return '<tr><td><input type="checkbox" data-chg="pickChk" data-line="' + l.lineId + '"' + (p.check ? ' checked' : '') + dis + ' aria-label="Picked ' + esc(l.sku) + '"></td>' +
                                 '<td class="whc-mono">' + esc(l.bin || '\u2013') + '</td><td>' + esc(l.name) + '<div class="whc-sub">' + esc(l.sku) + '</div></td>' +
-                                '<td>' + l.committed + (l.committed < l.remaining ? '<div class="whc-sub">' + (l.remaining - l.committed) + ' on backorder</div>' : '') + '</td>' +
+                                '<td>' + l.committed + (l.committed < l.remaining ? '<div class="whc-sub">' + (l.remaining - l.committed) + ' not released</div>' : '') + '</td>' +
                                 '<td><input type="number" min="1" max="' + l.committed + '" value="' + esc(p.qty) + '" data-chg="pickQty" data-line="' + l.lineId + '"' + dis + ' aria-label="Qty picked ' + esc(l.sku) + '"></td></tr>';
                         }).join('') +
                         r.lines.filter((l) => l.dropship && l.remaining > 0).map((l) =>
                             '<tr class="ds"><td>\u2013</td><td>\u2013</td><td>' + esc(l.name) + '<div class="whc-sub">' + esc(l.sku) + '</div></td><td colspan="2">' + (l.po ? 'Dropship, ' + esc(l.po) + ' · excluded' : 'Dropship · awaiting PO') + '</td></tr>'
                         ).join('') + '</tbody></table></div>';
-                    foot = (r.printed ? '' : '<button type="button" class="whc-btn link" data-act="unrelease" data-k="' + r.id + '" data-busy="on">Return to release</button>') +
+                    foot = (r.printed || !CFG.canRelease ? '' : '<button type="button" class="whc-btn link" data-act="unrelease" data-k="' + r.id + '" data-busy="on">Return to release</button>') +
                         '<button type="button" class="whc-btn" data-act="ticketOne" data-k="' + r.id + '" data-busy="on">' + (r.printed ? 'Reprint ticket' : 'Print ticket') + '</button>' +
                         '<button type="button" class="whc-btn" data-act="checkAll" data-busy="' + (r.printed ? 'on' : 'off') + '">Select all</button>' +
                         '<button type="button" class="whc-btn primary" data-act="markPicked" data-k="' + r.id + '" data-busy="' + (r.printed && anyChecked ? 'on' : 'off') + '">Mark picked</button>';
@@ -622,13 +714,13 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
 
                     if (st === 'picked') {
                         const ok = packReady();
-                        const fields=['weight'].concat(d.packageSublist==='packagefedex'?axes:['descr']);
-                        body=info+lines+'<h3>Packages</h3>'+boxList(S.pkgs,true)+'<h3>'+(S.editBox<0?'New box':'Edit box '+(1+S.editBox))+'</h3><div class="whc-dims">'+fields.map(k=>'<label>'+({weight:'Weight (lb)',length:'Length (in)',width:'Width (in)',height:'Height (in)',descr:'Description'})[k]+'<input data-chg="box" data-f="'+k+'" type="'+(k==='descr'?'text':'number')+'" step="any" min="0" value="'+esc(axes.includes(k)?(S.box.dimensions||{})[k]:S.box[k])+'"></label>').join('')+'</div><p><button type="button" class="whc-btn" data-act="addPkg">Add/Edit</button> <button type="button" class="whc-btn link" data-act="clearPkg">Clear</button></p>';
+                        const fields = ['weight'].concat(d.packageSublist === 'packagefedex' ? axes : ['descr']);
+                        body = info + lines + '<h3>Packages</h3>' + boxList(S.pkgs, true) + '<h3>' + (S.editBox < 0 ? 'New box' : 'Edit box ' + (1 + S.editBox)) + '</h3><div class="whc-dims">' + fields.map(k => '<label>' + ({ weight: 'Weight (lb)', length: 'Length (in)', width: 'Width (in)', height: 'Height (in)', descr: 'Description' })[k] + '<input data-chg="box" data-f="' + k + '" type="' + (k === 'descr' ? 'text' : 'number') + '" step="any" min="0" value="' + esc(axes.includes(k) ? (S.box.dimensions || {})[k] : S.box[k]) + '"></label>').join('') + '</div><p><button type="button" class="whc-btn" data-act="addPkg">Add/Edit</button> <button type="button" class="whc-btn link" data-act="clearPkg">Clear</button></p>';
                         foot = slip + '<button type="button" class="whc-btn primary" data-act="markPacked" data-k="' + r.ifId + '" data-busy="' + (ok ? 'on' : 'off') + '">Mark packed</button>';
                     } else if (st === 'packed') {
                         body = (!d.tracking.some((n) => String(n).trim()) ? '<div class="whc-banner warn">Add a tracking number on the fulfillment before shipping.</div>' : '') + (d.labelPrinted ? '<div class="whc-banner ok">Label ready. Confirm shipment when dispatched.</div>'
                             : '<div class="whc-banner warn">Print a label to continue.</div>') + info + lines +
-                            '<h3>Packages</h3>'+boxList(d.packages,false);
+                            '<h3>Packages</h3>' + boxList(d.packages, false);
                         foot = slip + '<button type="button" class="whc-btn" data-act="shippingCost" data-k="' + r.ifId + '" data-busy="on">Calculate shipping cost</button>' + '<button type="button" class="whc-btn' + (d.labelPrinted ? '' : ' primary') + '" data-act="labelOne" data-k="' + r.ifId + '" data-busy="on">' + (d.labelPrinted ? 'Reprint label' : 'Print label') + '</button>' +
                             '<button type="button" class="whc-btn' + (d.labelPrinted ? ' primary' : '') + '" data-act="shipOne" data-k="' + r.ifId + '" data-busy="' + (d.labelPrinted && d.tracking.some((n) => String(n).trim()) ? 'on' : 'off') + '">Mark shipped</button>';
                     } else {
@@ -896,31 +988,51 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
         const ACT = {
             noop() {},
             refresh() { load(); },
-            tab(el) { S.tab = el.dataset.k; S.workflow='all'; S.sel.clear(); render(); },
+            tab(el) { S.tab = el.dataset.k; S.workflow = 'all'; S.sel.clear(); render(); },
             open(el, e) { if (e.target.closest('a')) return; openDrawer(el.dataset.k); },
             close() { closeDrawer(); },
             releaseSel() {
-                const ids = selected().filter((k) => findRow(k).row.commit !== 'none' && !findRow(k).row.blocked);
+                const ids = selected().filter((k) => findRow(k).row.relCommit !== 'none' && !findRow(k).row.blocked);
                 act('release', { soIds: ids }, (r) => 'Released ' + plural(r.released.length, 'order') + (r.skipped.length ? ', skipped ' + r.skipped.length : ''));
                 S.sel.clear();
             },
-            releaseOne(el) { act('release', { soIds: [el.dataset.k] }, (r) => r.released.length ? 'Order released' : ((r.skipped[0] || {}).reason || 'Not released')); },
+            relAll() {
+                const f = findRow(S.drawer); if (!f) return;
+                f.row.lines.forEach((l) => {
+                    const s = S.rel[l.lineId];
+                    if (s && l.releasable > 0) { s.r = true; s.rq = Math.min(l.releasable, l.unreleased); }
+                });
+                renderDrawer();
+            },
+            applyRelease(el) {
+                const f = findRow(el.dataset.k); if (!f) return;
+                const v = relCheck(f.row);
+                if (!v.ok) { refreshRelease(); return; }
+                act('releaseLines', { soId: el.dataset.k, lines: v.lines }, (r) => {
+                    const parts = [];
+                    if (r.released) parts.push('Released ' + r.released + ' units');
+                    if (r.dropship) parts.push('Dropship ' + r.dropship + ' units' + (r.pos && r.pos.length ? ' on ' + r.pos.join(', ') : ''));
+                    return (r.tranid ? r.tranid + ': ' : '') + parts.join(', ');
+                });
+            },
             unrelease(el) { act('unrelease', { soId: el.dataset.k }, 'Returned to release'); },
             ticketsSel() { printTickets(selected()); },
             ticketOne(el) { printTickets([el.dataset.k]); },
             checkAll() { Object.values(S.pick).forEach((p) => { p.check = true; }); renderDrawer(); },
             markPicked(el) {
-                root.querySelectorAll('[data-chg="pickQty"]').forEach(el=>{if(S.pick[el.dataset.line]) S.pick[el.dataset.line].qty=el.value;});
+                root.querySelectorAll('[data-chg="pickQty"]').forEach(el => { if (S.pick[el.dataset.line]) S.pick[el.dataset.line].qty = el.value; });
                 const lines = Object.keys(S.pick).filter((id) => S.pick[id].check).map((id) => ({ lineId: id, qty: Number(S.pick[id].qty) }));
-                act('pick', { soId: el.dataset.k, lines }, (r) => r.ifNum + ' created in Picked status');
+                act('pick', { soId: el.dataset.k, lines }, (r) => r.ifNum + ' created in Picked status' + (r.releasedRemaining ? '. Remaining released qty stays in Ready to pick' : ''));
             },
-            addPkg(){if(!validBox(S.box)){showError('Enter a positive weight and all applicable dimensions for this box.');return;}
-                if(S.editBox<0)S.pkgs.push(S.box);else S.pkgs[S.editBox]=S.box;
-                resetBox();$('whc-derror').replaceChildren();renderDrawer();},
-            clearPkg(){resetBox();renderDrawer();},
-            editPkg(el){if(S.boxDirty){showError('Use Add/Edit or Clear before switching boxes.');return;}S.editBox=Number(el.dataset.i);S.box=JSON.parse(JSON.stringify(S.pkgs[S.editBox]));renderDrawer();},
-            rmPkg(el){if(S.boxDirty){showError('Use Add/Edit or Clear before removing a box.');return;}S.pkgs.splice(Number(el.dataset.i),1);resetBox();renderDrawer();},
-            markPacked(el){if(packReady())act('pack',{ifId:el.dataset.k,packages:S.pkgs},'Marked packed');},
+            addPkg() {
+                if (!validBox(S.box)) { showError('Enter a positive weight and all applicable dimensions for this box.'); return; }
+                if (S.editBox < 0) S.pkgs.push(S.box); else S.pkgs[S.editBox] = S.box;
+                resetBox(); $('whc-derror').replaceChildren(); renderDrawer();
+            },
+            clearPkg() { resetBox(); renderDrawer(); },
+            editPkg(el) { if (S.boxDirty) { showError('Use Add/Edit or Clear before switching boxes.'); return; } S.editBox = Number(el.dataset.i); S.box = JSON.parse(JSON.stringify(S.pkgs[S.editBox])); renderDrawer(); },
+            rmPkg(el) { if (S.boxDirty) { showError('Use Add/Edit or Clear before removing a box.'); return; } S.pkgs.splice(Number(el.dataset.i), 1); resetBox(); renderDrawer(); },
+            markPacked(el) { if (packReady()) act('pack', { ifId: el.dataset.k, packages: S.pkgs }, 'Marked packed'); },
             packSlip(el) {
                 const r = findRow(el.dataset.k).row;
                 window.open(CFG.url + '&action=packslip&so=' + r.soId + '&if=' + r.ifId, '_blank');
@@ -938,7 +1050,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
 
         root.addEventListener('click', (e) => {
             if (e.target.matches('input[type="checkbox"]')) return;
-            if (e.target.id === 'whc-overlay') { if(!S.busy)closeDrawer(); return; }
+            if (e.target.id === 'whc-overlay') { if (!S.busy) closeDrawer(); return; }
             const el = e.target.closest('[data-act]');
             if (!el || el.disabled || S.busy) return;
             const fn = ACT[el.dataset.act];
@@ -950,13 +1062,23 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             if (!k) return;
             if (k === 'sel') { if (el.checked) S.sel.add(el.dataset.k); else S.sel.delete(el.dataset.k); renderList(); renderBulk(); }
             else if (k === 'selAll') { rows().forEach((r) => { if (el.checked) S.sel.add(keyOf(r)); else S.sel.delete(keyOf(r)); }); renderList(); renderBulk(); }
-            else if(k==='workflow'){S.workflow=el.value;renderList();renderBulk();}
+            else if (k === 'workflow') { S.workflow = el.value; renderList(); renderBulk(); }
             else if (k === 'ch') { S.ch = el.value; renderList(); renderBulk(); }
             else if (k === 'cm') { S.cm = el.value; renderList(); renderBulk(); }
+            else if (k === 'relChk' || k === 'dsChk') {
+                const s = S.rel[el.dataset.line]; if (!s) return;
+                if (k === 'relChk') s.r = el.checked; else s.d = el.checked;
+                renderDrawer();
+            }
+            else if (k === 'relQty' || k === 'dsQty') {
+                const s = S.rel[el.dataset.line]; if (!s) return;
+                if (k === 'relQty') s.rq = el.value; else s.dq = el.value;
+                refreshRelease();
+            }
             else if (k === 'pickChk') { S.pick[el.dataset.line].check = el.checked; renderDrawer(); }
             else if (k === 'pickQty') { S.pick[el.dataset.line].qty = el.value; }
             else if (k === 'box') {
-                S.boxDirty=true;const kf=el.dataset.f;if(axes.includes(kf)){if(!S.box.dimensions)S.box.dimensions={};S.box.dimensions[kf]=el.value;}else S.box[kf]=el.value;
+                S.boxDirty = true; const kf = el.dataset.f; if (axes.includes(kf)) { if (!S.box.dimensions) S.box.dimensions = {}; S.box.dimensions[kf] = el.value; } else S.box[kf] = el.value;
                 const btn = root.querySelector('[data-act="markPacked"]');
                 if (btn) { btn.dataset.busy = packReady() ? 'on' : 'off'; renderBusy(); }
             }
@@ -965,17 +1087,17 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
         root.addEventListener('input', (e) => {
             const k = e.target.dataset.chg;
             if (k === 'q') { S.q = e.target.value; renderList(); renderBulk(); }
-            else if (k === 'pickQty' && S.pick[e.target.dataset.line]) { S.pick[e.target.dataset.line].qty=e.target.value; }
+            else if (k === 'pickQty' && S.pick[e.target.dataset.line]) { S.pick[e.target.dataset.line].qty = e.target.value; }
+            else if (k === 'relQty' || k === 'dsQty') { e.target.dispatchEvent(new Event('change', { bubbles: true })); }
             else if (k === 'box') { e.target.dispatchEvent(new Event('change', { bubbles: true })); }
         });
 
         // NetSuite forms submit on Enter inside inputs; keep the console self-contained
         root.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && e.target.tagName === 'INPUT') e.preventDefault();
-            
         });
 
-        $('whc-overlay').addEventListener('cancel', e=>{ e.preventDefault(); if(!S.busy) closeDrawer(); });
+        $('whc-overlay').addEventListener('cancel', e => { e.preventDefault(); if (!S.busy) closeDrawer(); });
         load();
     }
 
