@@ -292,9 +292,12 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
     // released = qty in the warehouse queue, unreleased = open qty still to decide.
     // committed (kept as the field name the pick/ticket code uses) = pickable qty = released qty.
     function applyRelease(o) {
-        o.legacy = o.released && !o.lines.some((l) => l.rqSet);
+        // Nothing on a Pending Approval order counts as released, even if release data was
+        // copied onto it (Make Copy) or left from an earlier approval.
+        o.legacy = !o.pending && o.released && !o.lines.some((l) => l.rqSet);
         o.lines.forEach((l) => {
             if (l.dropship) { l.released = 0; l.unreleased = 0; l.releasable = 0; l.committed = 0; return; }
+            if (o.pending) l.released = 0;
             if (o.legacy) l.released = l.remaining;              // released before line-level release: whole open qty
             l.unreleased = Math.max(0, l.remaining - l.released);
             l.releasable = l.unreleased;
@@ -791,8 +794,24 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         }
         if (!pending && !reqs.length) throw new Error('Nothing to save.');
 
-        const legacyChanged = materializeLegacyRelease(so);
-        let released = 0, changed = legacyChanged;
+        let changed = false;
+        if (pending) {
+            // Start clean: clear release data copied onto the order or left from an earlier approval
+            for (let i = 0; i < so.getLineCount({ sublistId: 'item' }); i++) {
+                if (!hasValue(so.getSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, line: i }))) continue;
+                so.selectLine({ sublistId: 'item', line: i });
+                so.setCurrentSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, value: '' });
+                so.commitLine({ sublistId: 'item' });
+                changed = true;
+            }
+            [FLD.released, FLD.printed].forEach((f) => {
+                if (isTrue(so.getValue({ fieldId: f }))) { so.setValue({ fieldId: f, value: false }); changed = true; }
+            });
+            if (num(so.getValue({ fieldId: FLD.printCount }))) { so.setValue({ fieldId: FLD.printCount, value: 0 }); changed = true; }
+        } else {
+            changed = materializeLegacyRelease(so);
+        }
+        let released = 0;
         const poLines = [], newPoLines = [];
         const vendorCache = {};
 
