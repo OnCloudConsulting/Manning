@@ -119,6 +119,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             url: url.resolveScript({ scriptId: script.id, deploymentId: script.deploymentId }),
             soUrl: '/app/accounting/transactions/salesord.nl?id=',
             ifUrl: '/app/accounting/transactions/itemship.nl?id=',
+            poUrl: '/app/accounting/transactions/purchord.nl?id=',
             canRelease: lib.canRelease()
         };
         const safeCfg = JSON.stringify(cfg).replace(/<\/script>/gi, '<\\/script>');
@@ -219,14 +220,15 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
         const CFG = JSON.parse(document.getElementById('whc-config').textContent);
         const STAGES = [
             { id: 'release', t: 'Release',       s: 'Approve, choose warehouse, release or PO' },
+            { id: 'dropship', t: 'Drop Ship',    s: 'PO created, not yet delivered' },
             { id: 'ready',   t: 'Ready to Pick', s: 'Released, not yet picked' },
             { id: 'picked',  t: 'Picked',        s: 'Fulfillment status Picked' },
             { id: 'packed',  t: 'Packed',        s: 'Boxed and weighed, needs label' },
             { id: 'shipped', t: 'Shipped',       s: 'Recently shipped' }
         ];
-        const VISIBLE = STAGES.filter((s) => CFG.canRelease || s.id !== 'release');
-        const ORDER_TABS = { release: 1, ready: 1 };
-        const S = { costs: {}, tab: VISIBLE[0].id, board: null, sel: new Set(), q: '', ch: 'all', cm: 'all', st: 'all', relApprove: false, drawer: null, detail: null, pick: {}, rel: {}, pkgs: [], dims: {}, workflow: 'all', busy: false };
+        const VISIBLE = STAGES.filter((s) => CFG.canRelease || (s.id !== 'release' && s.id !== 'dropship'));
+        const ORDER_TABS = { release: 1, ready: 1, dropship: 1 };
+        const S = { costs: {}, tab: VISIBLE[0].id, board: null, sel: new Set(), q: '', ch: 'all', cm: 'all', st: 'all', od: 'all', relApprove: false, drawer: null, detail: null, pick: {}, rel: {}, pkgs: [], dims: {}, workflow: 'all', busy: false };
         const root = document.getElementById('whc');
         const $ = (id) => document.getElementById(id);
         const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -449,7 +451,8 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                 .filter((r) => S.tab !== 'release' || S.cm === 'all' || r.relCommit === S.cm)
                 .filter((r) => S.tab !== 'release' || S.st === 'all' || (S.st === 'pending') === !!r.pending)
                 .filter(r => S.workflow === 'all' || (S.tab === 'packed' ? !!r.labelPrinted : !!r.printed) === (S.workflow === 'yes'))
-                .filter((r) => !q || [r.tranid, r.soNum, r.ifNum, r.customer, r.channel].join(' ').toLowerCase().indexOf(q) > -1);
+                .filter((r) => S.tab !== 'dropship' || S.od === 'all' || (S.od === 'late') === !!r.overdue)
+                .filter((r) => !q || [r.tranid, r.soNum, r.ifNum, r.customer, r.channel].concat(r.pos || [], r.vendors || []).join(' ').toLowerCase().indexOf(q) > -1);
         }
 
         /* ---------- release (line level, on hand / available; no commitment) ---------- */
@@ -528,6 +531,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                     '<select data-chg="cm" aria-label="Stock">' + opt('all', S.cm, 'Any stock') + opt('full', S.cm, 'In stock') +
                     opt('partial', S.cm, 'Partial stock') + opt('none', S.cm, 'No stock') + '</select>';
             }
+            if (t === 'dropship') h += '<select data-chg="od" aria-label="Due">' + opt('all', S.od, 'All POs') + opt('late', S.od, 'Past receive-by date') + opt('ontime', S.od, 'Not yet due') + '</select>';
             if (t === 'packed' || t === 'ready') h += '<select aria-label="Workflow status" data-chg="workflow">' + opt('all', S.workflow, 'All statuses') + opt('yes', S.workflow, t === 'packed' ? 'Label ready' : 'Ticket printed') + opt('no', S.workflow, t === 'packed' ? 'Needs label' : 'Needs ticket') + '</select>';
             h += '<span class="whc-sp"></span><button type="button" class="whc-btn" data-act="refresh">Refresh</button><span id="whc-bulk"></span>';
             $('whc-toolbar').innerHTML = h;
@@ -560,7 +564,8 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             const t = S.tab, list = rows();
             const hasCb = t === 'release' || t === 'ready' || t === 'packed';
             const head = {
-                release: ['Order', 'Channel', 'Date', 'Customer', 'Ship via', 'To release', 'Commitment'],
+                release: ['Order', 'Channel', 'Date', 'Customer', 'Ship via', 'To release', 'Stock'],
+                dropship: ['Order', 'Channel', 'Customer', 'PO', 'Vendor', 'Pending', 'PO age', 'Receive by'],
                 ready:   ['Order', 'Channel', 'Released', 'Customer', 'Ship via', 'To pick', 'Picking ticket'],
                 picked:  ['Fulfillment', 'Channel', 'Order', 'Customer', 'Ship via', 'Date', 'Lines'],
                 packed:  ['Fulfillment', 'Channel', 'Order', 'Customer', 'Ship via', 'Shipping cost', 'Date', 'Label'],
@@ -569,6 +574,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             if (!list.length) {
                 $('whc-list').innerHTML = '<div class="whc-empty">' + ({
                     release: 'No open orders waiting for release.',
+                    dropship: 'No drop ship POs waiting for delivery.',
                     ready: 'Nothing to pick. Orders appear here once a manager releases them.',
                     picked: 'No picked fulfillments waiting to be packed.',
                     packed: 'No packed fulfillments waiting for a label.',
@@ -580,7 +586,13 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             const body = list.map((r) => {
                 const k = keyOf(r);
                 let c = [];
-                if (t === 'release') {
+                if (t === 'dropship') {
+                    c = ['<strong>' + esc(r.tranid) + '</strong><div class="whc-sub">' + esc(r.status) + '</div>', esc(r.channel), esc(r.customer),
+                        esc(r.pos.join(', ')), esc(r.vendors.join(', ')),
+                        r.units + ' units, ' + plural(r.lines.length, 'line'),
+                        r.daysOpen + ' days<div class="whc-sub">' + esc(r.oldestPo) + '</div>',
+                        r.overdue ? '<span class="pill bad">Late ' + esc(r.receiveBy) + '</span>' : (r.receiveBy ? esc(r.receiveBy) : '\u2013')];
+                } else if (t === 'release') {
                     c = ['<strong>' + esc(r.tranid) + '</strong><div class="whc-sub">' + (r.pending ? '<span class="pill warn">Pending Approval</span>' : esc(r.status)) + '</div>', esc(r.channel), esc(r.date), esc(r.customer), esc(r.shipVia),
                         plural(r.relLines, 'line') + ', ' + r.relUnits + ' units' + (r.releasedUnits ? '<div class="whc-sub">' + r.releasedUnits + ' already released</div>' : ''),
                         r.blocked ? '<span class="pill bad">' + esc(r.blocked) + '</span>' : commitPill(r.relCommit)];
@@ -704,7 +716,16 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                 const info = kv([['Customer', esc(r.customer)], ['Channel', esc(r.channel)], ['Ship via', esc(r.shipVia)], ['Order date', esc(r.date)],
                     ['Ship to', esc(r.shipTo).replace(/\r?\n/g, '<br>')]]);
 
-                if (st === 'release') {
+                if (st === 'dropship') {
+                    body = info + '<h3>Lines waiting on the vendor</h3><div class="whc-tw"><table class="whc-t whc-lines"><thead><tr>' +
+                        '<th>Item</th><th>PO</th><th>Vendor</th><th>PO status</th><th>Ordered</th><th>Delivered</th><th>Pending</th><th>Receive by</th></tr></thead><tbody>' +
+                        r.lines.map((l) => '<tr><td>' + esc(l.name) + '<div class="whc-sub">' + esc(l.sku) + '</div></td>' +
+                            '<td><a href="' + CFG.poUrl + l.poId + '" target="_blank" rel="noopener">' + esc(l.poNum) + '</a><div class="whc-sub">' + esc(l.poDate) + ' \u00b7 ' + l.daysOpen + ' days</div></td>' +
+                            '<td>' + esc(l.vendor) + '</td><td>' + esc(l.poStatus) + '</td><td>' + l.qty + '</td><td>' + l.delivered + '</td><td><strong>' + l.pending + '</strong></td>' +
+                            '<td>' + (l.overdue ? '<span class="pill bad">Late ' + esc(l.poDue) + '</span>' : esc(l.poDue || '\u2013')) + '</td></tr>').join('') +
+                        '</tbody></table></div>';
+                    foot = '';
+                } else if (st === 'release') {
                     const out = releaseBody(r);
                     body = out.body; foot = out.foot;
                 } else {
@@ -1104,6 +1125,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             else if (k === 'ch') { S.ch = el.value; renderList(); renderBulk(); }
             else if (k === 'cm') { S.cm = el.value; renderList(); renderBulk(); }
             else if (k === 'st') { S.st = el.value; renderList(); renderBulk(); }
+            else if (k === 'od') { S.od = el.value; renderList(); renderBulk(); }
             else if (k === 'relApprove') { S.relApprove = el.value === 'B'; renderDrawer(); }
             else if (k === 'relLoc') { const s = S.rel[el.dataset.line]; if (!s) return; s.loc = el.value; renderDrawer(); }
             else if (k === 'relChk' || k === 'dsChk') {
