@@ -36,7 +36,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
 
     const POST_ACTIONS = {
         release:         (b) => lib.release(b.soIds),
-        releaseLines:    (b) => lib.releaseLines(b.soId, b.lines),
+        releaseLines:    (b) => lib.releaseLines(b.soId, { approve: !!b.approve, lines: b.lines || [] }),
         unrelease:       (b) => lib.unrelease(b.soId),
         markPrinted:     (b) => lib.markPrinted(b.soIds),
         pick:            (b) => lib.pick(b.soId, b.lines),
@@ -207,7 +207,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
 #whc .whc-rel .ctl{display:flex;align-items:center;gap:6px}#whc .whc-rel .ctl input[type=number]{width:70px}
 #whc .whc-rel th.grp{background:#e3efee;color:#174f49;text-align:center}
 #whc .whc-rel td.short{color:var(--bad-ink);font-weight:600}
-#whc #whc-relerr:not(:empty){margin-top:12px}#whc #whc-relerr:empty{display:none}
+#whc #whc-relerr:not(:empty){margin-top:12px}#whc .whc-rel select{border:1px solid var(--line);border-radius:4px;padding:5px;max-width:180px;background:#fff}#whc .whc-status{display:flex;gap:14px;align-items:center;flex-wrap:wrap}#whc .whc-status select{margin-left:6px;border:1px solid #d9c38f;border-radius:4px;padding:5px}#whc #whc-relerr:empty{display:none}
 `;
 
     /* ================================================================== */
@@ -218,7 +218,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
         'use strict';
         const CFG = JSON.parse(document.getElementById('whc-config').textContent);
         const STAGES = [
-            { id: 'release', t: 'Release',       s: 'Manager reviews commitment' },
+            { id: 'release', t: 'Release',       s: 'Approve, choose warehouse, release or PO' },
             { id: 'ready',   t: 'Ready to Pick', s: 'Released, not yet picked' },
             { id: 'picked',  t: 'Picked',        s: 'Fulfillment status Picked' },
             { id: 'packed',  t: 'Packed',        s: 'Boxed and weighed, needs label' },
@@ -226,7 +226,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
         ];
         const VISIBLE = STAGES.filter((s) => CFG.canRelease || s.id !== 'release');
         const ORDER_TABS = { release: 1, ready: 1 };
-        const S = { costs: {}, tab: VISIBLE[0].id, board: null, sel: new Set(), q: '', ch: 'all', cm: 'all', drawer: null, detail: null, pick: {}, rel: {}, pkgs: [], dims: {}, workflow: 'all', busy: false };
+        const S = { costs: {}, tab: VISIBLE[0].id, board: null, sel: new Set(), q: '', ch: 'all', cm: 'all', st: 'all', relApprove: false, drawer: null, detail: null, pick: {}, rel: {}, pkgs: [], dims: {}, workflow: 'all', busy: false };
         const root = document.getElementById('whc');
         const $ = (id) => document.getElementById(id);
         const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -423,9 +423,9 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             return null;
         };
         function commitPill(c) {
-            if (c === 'full') return '<span class="pill ok">Committed</span>';
-            if (c === 'partial') return '<span class="pill warn">Partially committed</span>';
-            return '<span class="pill bad">Not committed</span>';
+            if (c === 'full') return '<span class="pill ok">In stock</span>';
+            if (c === 'partial') return '<span class="pill warn">Partial stock</span>';
+            return '<span class="pill bad">No stock</span>';
         }
         function dsNote(o) {
             let h = '';
@@ -447,36 +447,52 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             return (S.board[S.tab] || [])
                 .filter((r) => S.ch === 'all' || r.channel === S.ch)
                 .filter((r) => S.tab !== 'release' || S.cm === 'all' || r.relCommit === S.cm)
+                .filter((r) => S.tab !== 'release' || S.st === 'all' || (S.st === 'pending') === !!r.pending)
                 .filter(r => S.workflow === 'all' || (S.tab === 'packed' ? !!r.labelPrinted : !!r.printed) === (S.workflow === 'yes'))
                 .filter((r) => !q || [r.tranid, r.soNum, r.ifNum, r.customer, r.channel].join(' ').toLowerCase().indexOf(q) > -1);
         }
 
-        /* ---------- release (line level) ---------- */
+        /* ---------- release (line level, on hand / available; no commitment) ---------- */
+        function lineStock(l, loc) {
+            const s = (l.stock || {})[loc];
+            return s || { onHand: null, available: null };
+        }
+
         function initRelease(r) {
-            S.rel = {};
+            S.rel = {}; S.relApprove = !!r.pending;
             r.lines.forEach((l) => {
                 if (l.dropship || !(l.unreleased > 0)) return;
-                const rq = Math.min(l.releasable, l.unreleased);
-                S.rel[l.lineId] = { r: rq > 0, rq: rq, d: false };
+                const loc = l.defaultLoc || '';
+                const av = lineStock(l, loc).available;
+                const rq = av === null ? l.unreleased : Math.max(0, Math.min(l.unreleased, av));
+                S.rel[l.lineId] = { loc, r: rq > 0, rq: rq || l.unreleased, d: false };
             });
         }
 
         function relCheck(r) {
-            const lines = []; let sumR = 0, sumD = 0, error = '';
+            const lines = []; let sumR = 0, sumD = 0, error = '', warn = '';
             r.lines.forEach((l) => {
                 const s = S.rel[l.lineId]; if (!s) return;
                 const po = !!s.d;
                 const rq = s.r && !po ? Number(s.rq) : 0;
-                if (!rq && !po) return;
+                const locChanged = !!s.loc && s.loc !== (l.locId || '');
+                if (!rq && !po && !locChanged) return;
                 if (error) return;
                 if (!Number.isFinite(rq) || rq < 0) error = l.sku + ': enter a positive quantity.';
-                else if (rq > l.releasable) error = l.sku + ': only ' + l.releasable + ' committed and not yet released.';
                 else if (rq > l.unreleased) error = l.sku + ': only ' + l.unreleased + ' open and not released.';
+                else if (rq && !s.loc) error = l.sku + ': choose a location to release to.';
                 else if (po && l.hasPo) error = l.sku + ': this line already has a PO.';
-                lines.push({ lineId: l.lineId, releaseQty: rq, createPo: po }); sumR += rq; sumD += po ? 1 : 0;
+                else if (po && !r.pending && !warn) warn = 'Approved order: Create PO only works on lines NetSuite already marked Drop Ship / Special Order.';
+                const av = lineStock(l, s.loc).available;
+                if (rq && av !== null && rq > av && !warn) warn = l.sku + ': releasing ' + rq + ' but only ' + av + ' available at this location.';
+                lines.push({ lineId: l.lineId, location: s.loc, releaseQty: rq, createPo: po });
+                sumR += rq; sumD += po ? 1 : 0;
             });
-            const label = sumR && sumD ? 'Release & create PO' : sumD ? 'Create PO' : 'Release to warehouse';
-            return { ok: !error && lines.length > 0, error, lines, label, sumR, sumD };
+            if (!error && r.pending && (sumR || sumD) && !S.relApprove) error = 'Set the status to Pending Fulfillment to release lines or create POs.';
+            const approveOnly = r.pending && S.relApprove && !lines.length;
+            let label = sumR && sumD ? 'Release & create PO' : sumD ? 'Create PO' : sumR ? 'Release to warehouse' : 'Save';
+            if (r.pending && S.relApprove) label = 'Approve' + (sumR || sumD ? ' & ' + label.toLowerCase() : '');
+            return { ok: !error && (lines.length > 0 || approveOnly), error, warn, lines, label, sumR, sumD };
         }
 
         function refreshRelease() {
@@ -484,7 +500,8 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             const v = relCheck(f.row);
             const btn = root.querySelector('[data-act="applyRelease"]');
             if (btn) { btn.dataset.busy = v.ok ? 'on' : 'off'; btn.textContent = v.label; }
-            const err = $('whc-relerr'); if (err) err.textContent = v.error;
+            const box = $('whc-relerr');
+            if (box) { box.textContent = v.error || v.warn || ''; box.className = 'whc-banner ' + (v.error ? 'bad' : 'warn'); }
             renderBusy();
         }
 
@@ -507,8 +524,9 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             let h = '<input type="search" data-chg="q" placeholder="Search orders or customers" value="' + esc(S.q) + '" aria-label="Search">' +
                 '<select data-chg="ch" aria-label="Channel">' + opt('all', S.ch, 'All channels') + S.board.channels.map((c) => opt(c, S.ch, c)).join('') + '</select>';
             if (t === 'release') {
-                h += '<select data-chg="cm" aria-label="Commitment">' + opt('all', S.cm, 'Any commitment') + opt('full', S.cm, 'Committed') +
-                    opt('partial', S.cm, 'Partially committed') + opt('none', S.cm, 'Not committed') + '</select>';
+                h += '<select data-chg="st" aria-label="Order status">' + opt('all', S.st, 'All statuses') + opt('pending', S.st, 'Pending Approval') + opt('approved', S.st, 'Approved') + '</select>' +
+                    '<select data-chg="cm" aria-label="Stock">' + opt('all', S.cm, 'Any stock') + opt('full', S.cm, 'In stock') +
+                    opt('partial', S.cm, 'Partial stock') + opt('none', S.cm, 'No stock') + '</select>';
             }
             if (t === 'packed' || t === 'ready') h += '<select aria-label="Workflow status" data-chg="workflow">' + opt('all', S.workflow, 'All statuses') + opt('yes', S.workflow, t === 'packed' ? 'Label ready' : 'Ticket printed') + opt('no', S.workflow, t === 'packed' ? 'Needs label' : 'Needs ticket') + '</select>';
             h += '<span class="whc-sp"></span><button type="button" class="whc-btn" data-act="refresh">Refresh</button><span id="whc-bulk"></span>';
@@ -525,8 +543,8 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             const sel = selected(), t = S.tab;
             let h = '';
             if (t === 'release') {
-                const n = sel.filter((k) => findRow(k).row.relCommit !== 'none' && !findRow(k).row.blocked).length;
-                h = '<button type="button" class="whc-btn primary" data-act="releaseSel" data-busy="' + (n ? 'on' : 'off') + '" title="Releases all committed qty on the selected orders">Release committed' + (n ? ' (' + n + ')' : '') + '</button>';
+                const n = sel.filter((k) => !findRow(k).row.blocked).length;
+                h = '<button type="button" class="whc-btn primary" data-act="releaseSel" data-busy="' + (n ? 'on' : 'off') + '" title="Approves Pending Approval orders and releases all open qty">Approve & release all' + (n ? ' (' + n + ')' : '') + '</button>';
             } else if (t === 'ready') {
                 h = '<button type="button" class="whc-btn primary" data-act="ticketsSel" data-busy="' + (sel.length ? 'on' : 'off') + '">Print tickets' + (sel.length ? ' (' + sel.length + ')' : '') + '</button>';
             } else if (t === 'packed') {
@@ -563,7 +581,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                 const k = keyOf(r);
                 let c = [];
                 if (t === 'release') {
-                    c = ['<strong>' + esc(r.tranid) + '</strong><div class="whc-sub">' + esc(r.status) + '</div>', esc(r.channel), esc(r.date), esc(r.customer), esc(r.shipVia),
+                    c = ['<strong>' + esc(r.tranid) + '</strong><div class="whc-sub">' + (r.pending ? '<span class="pill warn">Pending Approval</span>' : esc(r.status)) + '</div>', esc(r.channel), esc(r.date), esc(r.customer), esc(r.shipVia),
                         plural(r.relLines, 'line') + ', ' + r.relUnits + ' units' + (r.releasedUnits ? '<div class="whc-sub">' + r.releasedUnits + ' already released</div>' : ''),
                         r.blocked ? '<span class="pill bad">' + esc(r.blocked) + '</span>' : commitPill(r.relCommit)];
                 } else if (t === 'ready') {
@@ -619,41 +637,56 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             const open = r.lines.filter((l) => !l.dropship && l.unreleased > 0);
             const other = r.lines.filter((l) => l.dropship || !(l.unreleased > 0));
             const v = relCheck(r);
+            const locs = S.board.locations || [];
             const rowsHtml = open.map((l) => {
                 const s = S.rel[l.lineId];
-                const short = l.available !== null && l.available !== undefined && l.available < l.unreleased;
+                const st = lineStock(l, s.loc);
+                const want = s.r && !s.d ? (Number(s.rq) || 0) : l.unreleased;
+                const short = st.available !== null && st.available < want;
+                const locLocked = l.released > 0;
+                const locSel = '<select data-chg="relLoc" data-line="' + esc(l.lineId) + '"' + (locLocked ? ' disabled' : '') + ' aria-label="Location ' + esc(l.sku) + '">' +
+                    (s.loc ? '' : '<option value="">Choose…</option>') +
+                    locs.map((x) => '<option value="' + esc(x.id) + '"' + (x.id === s.loc ? ' selected' : '') + '>' + esc(x.name) + '</option>').join('') +
+                    '</select>';
                 return '<tr>' +
                     '<td class="item">' + esc(l.name) + '<div class="whc-sub">' + esc(l.sku) + '</div></td>' +
                     '<td>' + l.unreleased + (l.released ? '<div class="whc-sub">' + l.released + ' released</div>' : '') + '</td>' +
-                    '<td>' + qtyFmt(l.onHand) + '</td>' +
-                    '<td' + (short ? ' class="short"' : '') + '>' + qtyFmt(l.available) + '</td>' +
-                    '<td>' + l.releasable + (l.commitQty > l.releasable ? '<div class="whc-sub">of ' + l.commitQty + '</div>' : '') + '</td>' +
-                    '<td><div class="ctl"><input type="checkbox" data-chg="relChk" data-line="' + esc(l.lineId) + '"' + (s.r && !s.d ? ' checked' : '') + (l.releasable > 0 && !s.d ? '' : ' disabled') + ' aria-label="Release ' + esc(l.sku) + '">' +
-                        '<input type="number" min="0" step="any" max="' + l.releasable + '" value="' + esc(s.rq) + '" data-chg="relQty" data-line="' + esc(l.lineId) + '"' + (s.r && !s.d ? '' : ' disabled') + ' aria-label="Release qty ' + esc(l.sku) + '"></div></td>' +
+                    '<td>' + locSel + '</td>' +
+                    '<td>' + qtyFmt(st.onHand) + '</td>' +
+                    '<td' + (short ? ' class="short"' : '') + '>' + qtyFmt(st.available) + '</td>' +
+                    '<td><div class="ctl"><input type="checkbox" data-chg="relChk" data-line="' + esc(l.lineId) + '"' + (s.r && !s.d ? ' checked' : '') + (s.d ? ' disabled' : '') + ' aria-label="Release ' + esc(l.sku) + '">' +
+                        '<input type="number" min="0" step="any" max="' + l.unreleased + '" value="' + esc(s.rq) + '" data-chg="relQty" data-line="' + esc(l.lineId) + '"' + (s.r && !s.d ? '' : ' disabled') + ' aria-label="Release qty ' + esc(l.sku) + '"></div></td>' +
                     '<td><div class="ctl"><input type="checkbox" data-chg="dsChk" data-line="' + esc(l.lineId) + '"' + (s.d ? ' checked' : '') + (l.hasPo ? ' disabled' : '') + ' aria-label="Create PO for ' + esc(l.sku) + '">' +
-                        '<span class="whc-sub">' + (l.hasPo ? 'PO exists' : 'Whole line') + '</span></div>' +
-                        '<div class="whc-sub">' + (l.vendor ? esc(l.vendor) : 'Item vendor') + '</div></td>' +
+                        '<span class="whc-sub">Drop ship, whole line</span></div>' +
+                        '<div class="whc-sub">' + (l.vendor ? esc(l.vendor) : 'No vendor on item') + '</div></td>' +
                     '</tr>';
             }).join('');
             const otherHtml = other.map((l) =>
                 '<tr class="ds"><td class="item">' + esc(l.name) + '<div class="whc-sub">' + esc(l.sku) + '</div></td><td colspan="6">' +
-                (l.dropship ? 'Dropship' + (l.po ? ', ' + esc(l.po) : '') + ' \u00b7 excluded'
+                (l.dropship ? 'PO ' + esc(l.po || '') + ' \u00b7 vendor ships'
                     : (l.remaining ? 'Fully released (' + l.released + ')' : 'Closed')) + '</td></tr>').join('');
 
             const info = kv([['Customer', esc(r.customer)], ['Channel', esc(r.channel)], ['Ship via', esc(r.shipVia)], ['Order date', esc(r.date)],
                 ['Ship to', esc(r.shipTo).replace(/\r?\n/g, '<br>')]]);
+            const statusCtl = r.pending
+                ? '<div class="whc-banner warn whc-status"><strong>Pending Approval</strong>' +
+                  '<label>Status <select data-chg="relApprove" aria-label="Order status">' +
+                  '<option value="A"' + (S.relApprove ? '' : ' selected') + '>Pending Approval</option>' +
+                  '<option value="B"' + (S.relApprove ? ' selected' : '') + '>Pending Fulfillment</option></select></label>' +
+                  '<span>Approving saves the lines; NetSuite creates and links the PO for lines marked Create PO.</span></div>'
+                : '';
             const banner = (r.blocked ? '<div class="whc-banner bad">' + esc(r.blocked) + '. Release is blocked; PO creation is still allowed unless the order is on hold.</div>' : '') +
-                (r.relCommit === 'none' ? '<div class="whc-banner warn">Nothing committed for the open qty. Release what arrives later, or create the PO.</div>'
-                : r.relCommit === 'partial' ? '<div class="whc-banner warn">Partial stock: ' + plural(r.relUnits - r.relReady, 'unit') + ' not committed.</div>'
-                : '<div class="whc-banner ok">All open qty is committed.</div>');
+                (r.relCommit === 'none' ? '<div class="whc-banner warn">No available stock at the selected locations. Create a PO or release what you have.</div>'
+                : r.relCommit === 'partial' ? '<div class="whc-banner warn">Partial stock: ' + plural(r.relUnits - r.relReady, 'unit') + ' not available.</div>'
+                : '<div class="whc-banner ok">All open qty is available.</div>');
 
             return {
-                body: banner + info +
-                    '<h3>Lines <small>Release committed qty to the warehouse, or create the PO for a Drop Ship / Special Order line</small></h3>' +
-                    '<div class="whc-tw"><table class="whc-t whc-lines whc-rel"><thead><tr><th>Item</th><th>Open</th><th>On hand</th><th>Available</th><th>Committed</th>' +
-                    '<th class="grp">Release to warehouse</th><th class="grp">Create PO <small>(Drop Ship / Special Order)</small></th></tr></thead><tbody>' + rowsHtml + otherHtml + '</tbody></table></div>' +
-                    '<div id="whc-relerr" class="whc-banner bad" role="alert">' + esc(v.error) + '</div>',
-                foot: '<button type="button" class="whc-btn" data-act="relAll">Check all releasable</button>' +
+                body: statusCtl + banner + info +
+                    '<h3>Lines <small>Choose the warehouse, release qty for picking, or create a drop ship PO</small></h3>' +
+                    '<div class="whc-tw"><table class="whc-t whc-lines whc-rel"><thead><tr><th>Item</th><th>Open</th><th>Location</th><th>On hand</th><th>Available</th>' +
+                    '<th class="grp">Release to warehouse</th><th class="grp">Create PO</th></tr></thead><tbody>' + rowsHtml + otherHtml + '</tbody></table></div>' +
+                    '<div id="whc-relerr" class="whc-banner ' + (v.error ? 'bad' : 'warn') + '" role="alert">' + esc(v.error || v.warn || '') + '</div>',
+                foot: '<button type="button" class="whc-btn" data-act="relAll">Release all available</button>' +
                     '<button type="button" class="whc-btn primary" data-act="applyRelease" data-k="' + r.id + '" data-busy="' + (v.ok ? 'on' : 'off') + '">' + v.label + '</button>'
             };
         }
@@ -992,27 +1025,32 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             open(el, e) { if (e.target.closest('a')) return; openDrawer(el.dataset.k); },
             close() { closeDrawer(); },
             releaseSel() {
-                const ids = selected().filter((k) => findRow(k).row.relCommit !== 'none' && !findRow(k).row.blocked);
+                const ids = selected().filter((k) => !findRow(k).row.blocked);
+                if (!window.confirm('Approve (if Pending Approval) and release all open qty on ' + plural(ids.length, 'order') + '? No POs are created.')) return;
                 act('release', { soIds: ids }, (r) => 'Released ' + plural(r.released.length, 'order') + (r.skipped.length ? ', skipped ' + r.skipped.length : ''));
                 S.sel.clear();
             },
             relAll() {
                 const f = findRow(S.drawer); if (!f) return;
                 f.row.lines.forEach((l) => {
-                    const s = S.rel[l.lineId];
-                    if (s && l.releasable > 0) { s.r = true; s.rq = Math.min(l.releasable, l.unreleased); }
+                    const s = S.rel[l.lineId]; if (!s || s.d) return;
+                    const av = lineStock(l, s.loc).available;
+                    const q = av === null ? l.unreleased : Math.max(0, Math.min(l.unreleased, av));
+                    s.r = q > 0; if (q > 0) s.rq = q;
                 });
+                if (f.row.pending) S.relApprove = true;
                 renderDrawer();
             },
             applyRelease(el) {
                 const f = findRow(el.dataset.k); if (!f) return;
                 const v = relCheck(f.row);
                 if (!v.ok) { refreshRelease(); return; }
-                act('releaseLines', { soId: el.dataset.k, lines: v.lines }, (r) => {
+                act('releaseLines', { soId: el.dataset.k, approve: !!(f.row.pending && S.relApprove), lines: v.lines }, (r) => {
                     const parts = [];
+                    if (r.approved) parts.push('Approved');
                     if (r.released) parts.push('Released ' + r.released + ' units');
                     if (r.pos && r.pos.length) parts.push('PO ' + r.pos.join(', '));
-                    return (r.tranid ? r.tranid + ': ' : '') + parts.join(', ');
+                    return (r.tranid ? r.tranid + ': ' : '') + (parts.join(', ') || 'Saved');
                 });
             },
             unrelease(el) { act('unrelease', { soId: el.dataset.k }, 'Returned to release'); },
@@ -1065,6 +1103,9 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             else if (k === 'workflow') { S.workflow = el.value; renderList(); renderBulk(); }
             else if (k === 'ch') { S.ch = el.value; renderList(); renderBulk(); }
             else if (k === 'cm') { S.cm = el.value; renderList(); renderBulk(); }
+            else if (k === 'st') { S.st = el.value; renderList(); renderBulk(); }
+            else if (k === 'relApprove') { S.relApprove = el.value === 'B'; renderDrawer(); }
+            else if (k === 'relLoc') { const s = S.rel[el.dataset.line]; if (!s) return; s.loc = el.value; renderDrawer(); }
             else if (k === 'relChk' || k === 'dsChk') {
                 const s = S.rel[el.dataset.line]; if (!s) return;
                 if (k === 'relChk') s.r = el.checked; else s.d = el.checked;
