@@ -78,6 +78,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                     }
                     case 'data':      return boardWithDiag(res);
                     case 'diag':      return json(res, { ok: true, result: lib.diagnose().filter((d) => !d.ok) });
+                    case 'stockcheck': return json(res, { ok: true, result: lib.stockCheck(p.so) });
                     case 'ifdetail':  return json(res, { ok: true, result: lib.getFulfillmentDetail(p.ifid) });
                     case 'ticketpdf': return res.writeFile({ file: lib.buildPickTickets(p.ids), isInline: true });
                     case 'packslip':  return res.writeFile({ file: lib.packingSlip(p.so, p.if), isInline: true });
@@ -657,8 +658,12 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                 const short = st.available !== null && st.available < want;
                 const locLocked = l.released > 0;
                 const locSel = '<select data-chg="relLoc" data-line="' + esc(l.lineId) + '"' + (locLocked ? ' disabled' : '') + ' aria-label="Location ' + esc(l.sku) + '">' +
-                    (s.loc ? '' : '<option value="">Choose…</option>') +
-                    locs.map((x) => '<option value="' + esc(x.id) + '"' + (x.id === s.loc ? ' selected' : '') + '>' + esc(x.name) + '</option>').join('') +
+                    (s.loc ? '' : '<option value="">Choose… (all locations)</option>') +
+                    locs.map((x) => {
+                        const xs = (l.stock || {})[x.id];
+                        return '<option value="' + esc(x.id) + '"' + (x.id === s.loc ? ' selected' : '') + '>' + esc(x.name) +
+                            (xs ? ' \u2013 ' + xs.available + ' avail' : '') + '</option>';
+                    }).join('') +
                     '</select>';
                 return '<tr>' +
                     '<td class="item">' + esc(l.name) + '<div class="whc-sub">' + esc(l.sku) + '</div></td>' +
