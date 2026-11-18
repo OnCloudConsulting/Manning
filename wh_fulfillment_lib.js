@@ -14,8 +14,10 @@
  *   Shipped      -> Item Fulfillment shipstatus C (last N days)
  *
  * Release
- *   - Each line can be partly released to the warehouse and partly sent to a dropship PO
- *     (the SO line is split; the new line gets createpo = DropShip and NetSuite / this lib creates the PO).
+ *   - Each line can be released to the warehouse (partly or fully), or sent to a PO.
+ *     PO creation mirrors the native line link (purchord.nl?soid=&specord=T|dropship=T&custid=&nexus=
+ *     &subsidiary=&entity=&poentity=). It works for lines NetSuite already marked Drop Ship / Special Order
+ *     (Create PO can't be changed once the order is approved).
  *   - Pick tickets, Ready to pick and pick validation use the released qty.
  *   - After a pick, released qty is reduced by what was picked.
  *   - Orders released before line-level release (header flag only, no line qty) keep the old behaviour:
@@ -617,103 +619,92 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         };
     }
 
-    // Orders released before line-level release: write the implicit released qty onto the lines first
+    // Orders released before line-level release: write the implicit released qty onto the lines first.
+    // Returns true when lines were changed.
     function materializeLegacyRelease(so) {
-        if (!isTrue(so.getValue({ fieldId: FLD.released }))) return;
+        if (!isTrue(so.getValue({ fieldId: FLD.released }))) return false;
         const n = so.getLineCount({ sublistId: 'item' });
         for (let i = 0; i < n; i++) {
-            if (hasValue(so.getSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, line: i }))) return;
+            if (hasValue(so.getSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, line: i }))) return false;
         }
+        let changed = false;
         for (let i = 0; i < n; i++) {
             so.selectLine({ sublistId: 'item', line: i });
             const s = soLineState(so);
             if (s.createdpo && s.com === 0) { so.cancelLine({ sublistId: 'item' }); continue; }
             so.setCurrentSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, value: s.com });
             so.commitLine({ sublistId: 'item' });
+            changed = true;
         }
+        return changed;
     }
 
     /**
-     * lines: [{ lineId, releaseQty, dropshipQty }]
-     * releaseQty  -> added to custcol_whc_release_qty (must be committed and not yet released)
-     * dropshipQty -> line converted (whole line) or split (part) with createpo = DropShip; PO created
+     * lines: [{ lineId, releaseQty, createPo }]
+     * releaseQty -> added to custcol_whc_release_qty (must be committed and not yet released)
+     * createPo   -> creates the PO for that line the same way as the native line link
+     *               (line must already be Drop Ship / Special Order with no PO)
      */
     function releaseLines(soId, lines) {
         assertRelease();
         const id = toIds(soId)[0];
         const reqs = (lines || [])
-            .map((l) => ({ lineId: String(l.lineId), r: Number(l.releaseQty) || 0, d: Number(l.dropshipQty) || 0 }))
-            .filter((x) => x.r !== 0 || x.d !== 0);
-        if (!reqs.length) throw new Error('Check at least one line to release or send to dropship.');
-        if (reqs.some((x) => x.r < 0 || x.d < 0)) throw new Error('Quantities must be positive.');
+            .map((l) => ({ lineId: String(l.lineId), r: Number(l.releaseQty) || 0, po: l.createPo === true || l.createPo === 'T' }))
+            .filter((x) => x.r !== 0 || x.po);
+        if (!reqs.length) throw new Error('Check at least one line to release or send to a PO.');
+        if (reqs.some((x) => x.r < 0)) throw new Error('Quantities must be positive.');
+        if (reqs.some((x) => x.r > 0 && x.po)) throw new Error('A line can be released or sent to a PO, not both.');
         assertOrderAllowed(id, reqs.some((x) => x.r > 0));
 
         const so = record.load({ type: record.Type.SALES_ORDER, id, isDynamic: true });
         const tranid = so.getValue({ fieldId: 'tranid' });
-        materializeLegacyRelease(so);
-        let released = 0, dropship = 0;
+        const legacyChanged = materializeLegacyRelease(so);
+        let released = 0;
+        const poLines = [];
 
         reqs.forEach((q) => {
             const idx = so.findSublistLineWithValue({ sublistId: 'item', fieldId: 'line', value: q.lineId });
             if (idx < 0) throw new Error(`${tranid}: a line is no longer on the order. Refresh and try again.`);
             so.selectLine({ sublistId: 'item', line: idx });
             const s = soLineState(so);
+
+            if (q.po) {
+                const createpo = so.getCurrentSublistValue({ sublistId: 'item', fieldId: 'createpo' });
+                so.cancelLine({ sublistId: 'item' });
+                if (s.createdpo) throw new Error(`${s.sku}: this line already has a PO.`);
+                if (createpo !== 'DropShip' && createpo !== 'SpecOrd') {
+                    throw new Error(`${s.sku}: the line is not marked Drop Ship or Special Order. NetSuite only allows that before the order is approved.`);
+                }
+                poLines.push(q.lineId);
+                return;
+            }
+
             const unreleased = s.remaining - s.rq;
             const releasable = Math.max(0, s.com - s.rq);
-
-            if (q.r + q.d > unreleased) throw new Error(`${s.sku}: ${q.r + q.d} requested but only ${unreleased} open and not released.`);
+            if (q.r > unreleased) throw new Error(`${s.sku}: ${q.r} requested but only ${unreleased} open and not released.`);
             if (q.r > releasable) throw new Error(`${s.sku}: only ${releasable} committed and not yet released.`);
-            if (q.d > 0 && s.createdpo) throw new Error(`${s.sku}: this line already has a PO.`);
-
-            if (q.r > 0) {
-                so.setCurrentSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, value: s.rq + q.r });
-                released += q.r;
-            }
-
-            if (q.d > 0) {
-                if (q.d === s.qty && s.pickedQty === 0 && s.rq + q.r === 0) {
-                    // Whole line goes to the vendor
-                    so.setCurrentSublistValue({ sublistId: 'item', fieldId: 'createpo', value: 'DropShip' });
-                    so.commitLine({ sublistId: 'item' });
-                } else {
-                    // Split: keep the warehouse qty on this line, add a dropship line for the rest
-                    const get = (f) => so.getCurrentSublistValue({ sublistId: 'item', fieldId: f });
-                    const item = get('item');
-                    const rate = get('rate');
-                    const units = get('units');
-                    so.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: s.qty - q.d });
-                    so.commitLine({ sublistId: 'item' });
-
-                    so.selectNewLine({ sublistId: 'item' });
-                    so.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: item });
-                    if (units) so.setCurrentSublistValue({ sublistId: 'item', fieldId: 'units', value: units });
-                    so.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: q.d });
-                    so.setCurrentSublistValue({ sublistId: 'item', fieldId: 'price', value: -1 });
-                    so.setCurrentSublistValue({ sublistId: 'item', fieldId: 'rate', value: rate });
-                    so.setCurrentSublistValue({ sublistId: 'item', fieldId: 'createpo', value: 'DropShip' });
-                    so.commitLine({ sublistId: 'item' });
-                }
-                dropship += q.d;
-            } else {
-                so.commitLine({ sublistId: 'item' });
-            }
+            so.setCurrentSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, value: s.rq + q.r });
+            so.commitLine({ sublistId: 'item' });
+            released += q.r;
         });
 
-        let totalReleased = 0;
-        for (let i = 0; i < so.getLineCount({ sublistId: 'item' }); i++) {
-            totalReleased += num(so.getSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, line: i }));
+        if (released > 0 || legacyChanged) {
+            let totalReleased = 0;
+            for (let i = 0; i < so.getLineCount({ sublistId: 'item' }); i++) {
+                totalReleased += num(so.getSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, line: i }));
+            }
+            so.setValue({ fieldId: FLD.released, value: totalReleased > 0 });
+            if (released > 0) {
+                so.setValue({ fieldId: FLD.releasedBy, value: userId() });
+                so.setValue({ fieldId: FLD.releasedOn, value: new Date() });
+            }
+            so.save({ enableSourcing: true, ignoreMandatoryFields: true });
         }
-        so.setValue({ fieldId: FLD.released, value: totalReleased > 0 });
-        if (released > 0) {
-            so.setValue({ fieldId: FLD.releasedBy, value: userId() });
-            so.setValue({ fieldId: FLD.releasedOn, value: new Date() });
-        }
-        so.save({ enableSourcing: true, ignoreMandatoryFields: true });
-        log.audit({ title: 'Release lines', details: { soId: id, tranid, released, dropship, lines: reqs } });
+        log.audit({ title: 'Release lines', details: { soId: id, tranid, released, poLines, lines: reqs } });
 
-        const result = { soId: id, tranid, released, dropship, pos: [], skipped: [] };
-        if (dropship > 0) {
-            const po = ensureDropshipPOs(id);
+        const result = { soId: id, tranid, released, pos: [], skipped: [] };
+        if (poLines.length) {
+            const po = createLinePOs(id, poLines);
             result.pos = po.pos;
             po.errors.forEach((e) => result.skipped.push({ reason: `${tranid}: ${e}` }));
         }
@@ -721,36 +712,49 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
     }
 
     /**
-     * NetSuite normally creates the dropship PO when the approved order is saved.
-     * If a DropShip line still has no PO, create one per vendor from the order.
+     * Creates the PO for the given SO lines, the same as clicking the line link and saving:
+     *   purchord.nl?soid=&specord=T|dropship=T&custid=&nexus=&subsidiary=&entity=&poentity=
+     * One PO per type + vendor. NetSuite adds every open line of that type and vendor without a PO.
      */
-    function ensureDropshipPOs(soId) {
+    function createLinePOs(soId, lineIds) {
         const so = record.load({ type: record.Type.SALES_ORDER, id: soId });
-        const customer = so.getValue({ fieldId: 'entity' });
+        const base = {
+            soid: soId,
+            custid: so.getValue({ fieldId: 'entity' }),
+            nexus: so.getValue({ fieldId: 'nexus' }),
+            subsidiary: so.getValue({ fieldId: 'subsidiary' })
+        };
+        const want = new Set(lineIds.map(String));
         const pending = {}, linked = new Set(), errors = [];
 
         for (let i = 0; i < so.getLineCount({ sublistId: 'item' }); i++) {
+            if (!want.has(String(so.getSublistValue({ sublistId: 'item', fieldId: 'line', line: i })))) continue;
             const createpo = so.getSublistValue({ sublistId: 'item', fieldId: 'createpo', line: i });
             const createdpo = so.getSublistValue({ sublistId: 'item', fieldId: 'createdpo', line: i });
-            if (createpo !== 'DropShip') continue;
-            if (createdpo) { linked.add(String(createdpo)); continue; }
-            const vendor = so.getSublistValue({ sublistId: 'item', fieldId: 'povendor', line: i });
             const sku = so.getSublistText({ sublistId: 'item', fieldId: 'item', line: i });
-            if (!vendor) { errors.push(`${sku} has no vendor. Set a preferred vendor on the item, then create the PO from the order.`); continue; }
-            pending[vendor] = true;
+            if (createdpo) { linked.add(String(createdpo)); continue; }
+            if (createpo !== 'DropShip' && createpo !== 'SpecOrd') { errors.push(`${sku}: not a Drop Ship / Special Order line.`); continue; }
+            const itemId = so.getSublistValue({ sublistId: 'item', fieldId: 'item', line: i });
+            const vendor = so.getSublistValue({ sublistId: 'item', fieldId: 'povendor', line: i }) || itemVendor(itemId);
+            if (!vendor) { errors.push(`${sku}: no vendor on the line or the item.`); continue; }
+            pending[`${createpo}|${vendor}`] = { type: createpo, vendor };
         }
 
-        Object.keys(pending).forEach((vendor) => {
+        Object.values(pending).forEach(({ type, vendor }) => {
+            const label = type === 'DropShip' ? 'Dropship' : 'Special order';
             try {
-                const po = record.create({
-                    type: record.Type.PURCHASE_ORDER, isDynamic: true,
-                    defaultValues: { soid: soId, dropship: 'T', custid: customer, entity: vendor }
-                });
+                const defaults = Object.assign({}, base, { entity: vendor, poentity: vendor });
+                if (type === 'DropShip') defaults.dropship = 'T'; else defaults.specord = 'T';
+                Object.keys(defaults).forEach((k) => { if (!hasValue(defaults[k])) delete defaults[k]; });
+
+                const po = record.create({ type: record.Type.PURCHASE_ORDER, isDynamic: true, defaultValues: defaults });
+                if (!po.getLineCount({ sublistId: 'item' })) throw new Error('NetSuite returned no lines for this vendor.');
                 const poId = po.save({ enableSourcing: true, ignoreMandatoryFields: true });
                 linked.add(String(poId));
-                log.audit({ title: 'Dropship PO created by fallback', details: { soId, vendor, poId } });
+                log.audit({ title: 'PO created from SO', details: { soId, type, vendor, poId } });
             } catch (e) {
-                errors.push(`Dropship PO could not be created automatically (${e.message}). Use Drop Ship on the order line.`);
+                log.error({ title: 'PO creation failed', details: { soId, type, vendor, error: e.message } });
+                errors.push(`${label} PO for vendor ${vendor} not created (${e.message}).`);
             }
         });
 
@@ -761,7 +765,22 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         return { pos, errors };
     }
 
-    // Bulk: release all committed, unreleased qty on each order (no dropship)
+    // Preferred vendor, else the first vendor on the item
+    function itemVendor(itemId) {
+        try {
+            const rows = query.runSuiteQL({
+                query: `SELECT iv.vendor AS vendor FROM itemvendor iv
+                        WHERE iv.item = ? ORDER BY CASE WHEN iv.preferredvendor = 'T' THEN 0 ELSE 1 END`,
+                params: [itemId]
+            }).asMappedResults();
+            return rows.length ? String(rows[0].vendor) : '';
+        } catch (e) {
+            log.audit({ title: 'Item vendor lookup failed', details: { itemId, error: e.message } });
+            return '';
+        }
+    }
+
+    // Bulk: release all committed, unreleased qty on each order (no PO)
     function release(soIds) {
         assertRelease();
         const ids = toIds(soIds);
@@ -773,7 +792,7 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
             if (blocked) { skipped.push({ id: o.id, tranid: o.tranid, reason: blocked }); return; }
             const lines = o.lines
                 .filter((l) => !l.dropship && l.releasable > 0 && l.unreleased > 0)
-                .map((l) => ({ lineId: l.lineId, releaseQty: Math.min(l.releasable, l.unreleased), dropshipQty: 0 }));
+                .map((l) => ({ lineId: l.lineId, releaseQty: Math.min(l.releasable, l.unreleased), createPo: false }));
             if (!lines.length) { skipped.push({ id: o.id, tranid: o.tranid, reason: `${o.tranid}: nothing committed to release.` }); return; }
             try {
                 const r = releaseLines(o.id, lines);
