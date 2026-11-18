@@ -13,7 +13,12 @@
  *   Packed       -> Item Fulfillment shipstatus B (packages populated)
  *   Shipped      -> Item Fulfillment shipstatus C (last N days)
  *
- * Release
+ * Release (commitment is NOT used: Fulfill Based on Commitment = Ignore Commitment)
+ *   - Release tab shows Pending Approval orders and approved orders with unreleased open qty,
+ *     with on hand / available per location.
+ *   - Per line: pick the location, release qty to the warehouse, or Create PO (Drop Ship, item vendor).
+ *   - Submit on a Pending Approval order sets the lines and approves it in one save, so NetSuite
+ *     creates and links the dropship PO itself. A line with a linked PO is excluded from the warehouse.
  *   - Each line can be released to the warehouse (partly or fully), or sent to a PO.
  *     PO creation mirrors the native line link (purchord.nl?soid=&specord=T|dropship=T&custid=&nexus=
  *     &subsidiary=&entity=&poentity=). It works for lines NetSuite already marked Drop Ship / Special Order
@@ -130,14 +135,15 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
             ['SO', `t.${FLD.printed}`], ['SO', `BUILTIN.DF(t.${FLD.printedBy})`], ['SO', `t.${FLD.printedOn}`], ['SO', `t.${FLD.printCount}`],
             ['SO', 'tl.id'], ['SO', 'tl.quantity'], ['SO', 'tl.quantityshiprecv'], ['SO', 'tl.quantitycommitted'],
             ['SO', 'tl.quantitypicked'], ['SO', 'tl.createdpo'], ['SO', 'BUILTIN.DF(tl.createdpo)'], ['SO', `tl.${FLD.releaseQty}`],
-            ['SO', 'tl.isclosed'], ['SO', 'tl.taxline'], ['SO', 'tl.location'], ['SO', 'tl.linesequencenumber'],
+            ['SO', 'tl.isclosed'], ['SO', 'tl.taxline'], ['SO', 'tl.location'], ['SO', 'BUILTIN.DF(tl.location)'], ['SO', 't.location'], ['SO', 'tl.linesequencenumber'],
             ['SO', 'i.itemid'], ['SO', 'i.displayname'], ['SO', 'i.itemtype'],
             ['IF', 'f.status'], ['IF', `f.${FLD.labelPrinted}`], ['IF', 'BUILTIN.DF(f.shipmethod)'],
             ['IF', 'fl.createdfrom'], ['IF', 'fl.iscogs'], ['IF', 'fl.location'], ['IF', 'fl.item']
         ];
         const extra = [
             ['address join', `SELECT tsa.addrtext AS x FROM transaction t LEFT JOIN transactionShippingAddress tsa ON tsa.nkey = t.shippingaddress WHERE t.type = 'SalesOrd' AND ROWNUM <= 1`],
-            ['itemvendor', `SELECT iv.item AS x FROM itemvendor iv WHERE iv.preferredvendor = 'T' AND ROWNUM <= 1`]
+            ['itemvendor', `SELECT iv.item AS x FROM itemvendor iv WHERE iv.preferredvendor = 'T' AND ROWNUM <= 1`],
+            ['location list', `SELECT id AS x FROM location WHERE NVL(isinactive, 'F') = 'F' AND ROWNUM <= 1`]
         ];
         const extraRes = extra.map(([expr, q]) => {
             try { query.runSuiteQL({ query: q }); return { src: 'SO', expr, ok: true }; }
@@ -182,14 +188,15 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         const args = [...ITEM_TYPES];
         let where = `
             t.type = 'SalesOrd'
-            AND t.status IN ('B','D','E')
+            AND t.status IN ('A','B','D','E')
             AND tl.mainline = 'F'
             AND tl.taxline = 'F'
             AND NVL(tl.isclosed, 'F') = 'F'
             AND i.itemtype IN (${qMarks(ITEM_TYPES)})`;
 
         if (p.location) {
-            where += ` AND (tl.location = ? OR tl.createdpo IS NOT NULL)`;
+            // Pending Approval lines may not have a location yet
+            where += ` AND (tl.location = ? OR tl.location IS NULL OR tl.createdpo IS NOT NULL)`;
             args.push(p.location);
         }
         if (soIds && soIds.length) {
@@ -202,11 +209,13 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
                 t.id                                   AS so_id,
                 t.tranid                               AS tranid,
                 t.trandate                             AS trandate,
+                t.status                               AS status_code,
                 BUILTIN.DF(t.status)                   AS status_text,
                 BUILTIN.DF(t.${FLD.channel})           AS channel,
                 BUILTIN.DF(t.entity)                   AS customer,
                 BUILTIN.DF(t.shipmethod)               AS ship_via,
                 tsa.addrtext                           AS ship_to,
+                t.location                             AS hdr_loc,
                 t.${FLD.hold}                          AS on_hold,
                 t.${FLD.doNotPick}                     AS do_not_pick,
                 t.${FLD.released}                      AS released,
@@ -218,12 +227,13 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
                 t.${FLD.printCount}                    AS print_count,
                 tl.id                                  AS line_id,
                 tl.item                                AS item_id,
+                tl.location                            AS loc_id,
+                BUILTIN.DF(tl.location)                AS loc_name,
                 i.itemid                               AS sku,
                 NVL(i.displayname, i.itemid)           AS item_name,
                 ABS(tl.quantity)                       AS qty,
                 NVL(tl.quantityshiprecv, 0)            AS fulfilled,
                 NVL(tl.quantitypicked, 0)              AS qty_picked,
-                NVL(tl.quantitycommitted, 0)           AS qty_committed,
                 tl.${FLD.releaseQty}                   AS release_qty,
                 tl.createdpo                           AS po_id,
                 BUILTIN.DF(tl.createdpo)               AS po_num
@@ -240,8 +250,9 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
             if (!o) {
                 o = {
                     id: r.so_id, tranid: r.tranid, date: r.trandate, status: r.status_text,
+                    statusCode: r.status_code, pending: r.status_code === 'A',
                     channel: r.channel || '', customer: r.customer || '', shipVia: r.ship_via || '',
-                    shipTo: r.ship_to || '',
+                    shipTo: r.ship_to || '', hdrLoc: r.hdr_loc ? String(r.hdr_loc) : '',
                     blocked: isTrue(r.on_hold) ? 'On hold' : (isTrue(r.do_not_pick) ? 'Do not pick' : ''),
                     released: isTrue(r.released), releasedBy: r.released_by || '', releasedOn: r.released_on || '',
                     printed: isTrue(r.printed), printedBy: r.printed_by || '', printedOn: r.printed_on || '',
@@ -252,20 +263,19 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
             const qty = num(r.qty);
             const ful = Math.abs(num(r.fulfilled));
             // Native picked quantity is cumulative through packed and shipped.
-            // Committed still includes picked/packed quantities until shipment.
             const picked = Math.max(ful, Math.abs(num(r.qty_picked)));
-            const inProgress = Math.max(0, picked - ful);
             const rem = Math.max(0, qty - picked);
-            const com = Math.min(Math.max(0, num(r.qty_committed) - inProgress), rem);
-            const ds  = !!r.po_id && com === 0;          // dropship (or unreceived special order) with PO
+            // Commitment is not used (Fulfill Based on Commitment = Ignore Commitment).
+            // A line with a linked PO is vendor-fulfilled (dropship) and excluded from the warehouse.
+            const ds = !!r.po_id;
             o.lines.push({
                 lineId: r.line_id, itemId: r.item_id, sku: r.sku, name: r.item_name,
+                locId: r.loc_id ? String(r.loc_id) : '', locName: r.loc_name || '',
                 qty, fulfilled: ful, picked, remaining: rem,
-                commitQty: ds ? 0 : com,                   // committed open qty
-                committed: ds ? 0 : com,                   // pickable qty; capped to released qty in applyRelease
                 rqSet: hasValue(r.release_qty),
                 released: Math.min(Math.max(0, num(r.release_qty)), rem),
-                dropship: ds, hasPo: !!r.po_id, po: r.po_id ? (r.po_num || String(r.po_id)) : null,
+                committed: 0,
+                dropship: ds, hasPo: ds, po: r.po_id ? (r.po_num || String(r.po_id)) : null,
                 ignored: ds,
                 bin: '', binId: null
             });
@@ -276,15 +286,16 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         return orders.map(decorate);
     }
 
-    // Splits each line into released / unreleased / releasable and caps pickable qty to released qty.
+    // released = qty in the warehouse queue, unreleased = open qty still to decide.
+    // committed (kept as the field name the pick/ticket code uses) = pickable qty = released qty.
     function applyRelease(o) {
         o.legacy = o.released && !o.lines.some((l) => l.rqSet);
         o.lines.forEach((l) => {
             if (l.dropship) { l.released = 0; l.unreleased = 0; l.releasable = 0; l.committed = 0; return; }
-            if (o.legacy) l.released = Math.min(l.commitQty, l.remaining);
+            if (o.legacy) l.released = l.remaining;              // released before line-level release: whole open qty
             l.unreleased = Math.max(0, l.remaining - l.released);
-            l.releasable = Math.max(0, Math.min(l.commitQty, l.remaining) - l.released);
-            l.committed  = Math.min(l.commitQty, l.released);
+            l.releasable = l.unreleased;
+            l.committed  = l.released;
         });
     }
 
@@ -298,15 +309,15 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         o.pickUnits   = have;
         o.commit      = have === 0 ? 'none' : (have < need ? 'partial' : 'full');
         o.ignoredPos  = o.lines.filter((l) => l.ignored && l.remaining > 0).map((l) => l.po);
-        o.awaitingPo  = o.lines.filter((l) => l.dropship && !l.po && l.remaining > 0).length;
+        o.awaitingPo  = 0;
 
-        // Release view (unreleased qty only)
+        // Release view (unreleased qty only); stock status is set in attachStock
         const relOpen = o.lines.filter((l) => !l.dropship && l.unreleased > 0);
         o.relLines      = relOpen.length;
         o.relUnits      = relOpen.reduce((a, l) => a + l.unreleased, 0);
-        o.relReady      = relOpen.reduce((a, l) => a + Math.min(l.releasable, l.unreleased), 0);
+        o.relReady      = 0;
         o.releasedUnits = o.lines.reduce((a, l) => a + (l.dropship ? 0 : l.released), 0);
-        o.relCommit     = o.relReady === 0 ? 'none' : (o.relReady < o.relUnits ? 'partial' : 'full');
+        o.relCommit     = 'none';
         return o;
     }
 
@@ -355,21 +366,30 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         }));
     }
 
-    // On hand / available per item (location columns when the location parameter is set)
+    // On hand / available per item per location: { itemId: { locId: { onHand, available } } }
     function getStock(itemIds) {
         const out = {};
         if (!itemIds.length) return out;
         try {
-            const p = getParams();
-            const cols = p.location ? ['locationquantityonhand', 'locationquantityavailable'] : ['quantityonhand', 'quantityavailable'];
-            chunk(itemIds, 900).forEach((ids) => {
-                const filters = [['internalid', 'anyof', ids]];
-                if (p.location) filters.push('AND', ['inventorylocation', 'anyof', p.location]);
-                search.create({ type: search.Type.ITEM, filters, columns: cols.map((n) => search.createColumn({ name: n })) })
-                    .run().each((r) => {
-                        out[r.id] = { onHand: num(r.getValue({ name: cols[0] })), available: num(r.getValue({ name: cols[1] })) };
-                        return true;
-                    });
+            chunk(itemIds, 500).forEach((ids) => {
+                search.create({
+                    type: search.Type.ITEM,
+                    filters: [['internalid', 'anyof', ids]],
+                    columns: [
+                        search.createColumn({ name: 'inventorylocation' }),
+                        search.createColumn({ name: 'locationquantityonhand' }),
+                        search.createColumn({ name: 'locationquantityavailable' })
+                    ]
+                }).run().each((r) => {
+                    const loc = r.getValue({ name: 'inventorylocation' });
+                    if (!loc) return true;
+                    if (!out[r.id]) out[r.id] = {};
+                    out[r.id][String(loc)] = {
+                        onHand: num(r.getValue({ name: 'locationquantityonhand' })),
+                        available: num(r.getValue({ name: 'locationquantityavailable' }))
+                    };
+                    return true;
+                });
             });
         } catch (e) {
             log.audit({ title: 'Stock lookup unavailable', details: e.message });
@@ -383,27 +403,50 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         try {
             chunk(itemIds, 900).forEach((ids) => {
                 query.runSuiteQL({
-                    query: `SELECT iv.item AS item_id, BUILTIN.DF(iv.vendor) AS vendor
-                            FROM itemvendor iv WHERE iv.preferredvendor = 'T' AND iv.item IN (${qMarks(ids)})`,
+                    query: `SELECT iv.item AS item_id, iv.vendor AS vendor_id, BUILTIN.DF(iv.vendor) AS vendor
+                            FROM itemvendor iv WHERE iv.item IN (${qMarks(ids)})
+                            ORDER BY CASE WHEN iv.preferredvendor = 'T' THEN 0 ELSE 1 END`,
                     params: ids
-                }).asMappedResults().forEach((r) => { out[r.item_id] = r.vendor; });
+                }).asMappedResults().forEach((r) => {
+                    if (!out[r.item_id]) out[r.item_id] = { id: String(r.vendor_id), name: r.vendor };
+                });
             });
         } catch (e) {
-            log.audit({ title: 'Preferred vendor lookup unavailable', details: e.message });
+            log.audit({ title: 'Vendor lookup unavailable', details: e.message });
         }
         return out;
     }
 
+    function getLocations() {
+        try {
+            return runSql(`SELECT id, name FROM location WHERE NVL(isinactive, 'F') = 'F' ORDER BY name`, [])
+                .map((r) => ({ id: String(r.id), name: r.name }));
+        } catch (e) {
+            log.audit({ title: 'Location list unavailable', details: e.message });
+            return [];
+        }
+    }
+
     function attachStock(orders) {
+        const p = getParams();
         const ids = [...new Set(orders.flatMap((o) => o.lines.map((l) => l.itemId)))];
         const stock = getStock(ids);
         const vendors = getVendors(ids);
-        orders.forEach((o) => o.lines.forEach((l) => {
-            const s = stock[l.itemId];
-            l.onHand = s ? s.onHand : null;
-            l.available = s ? s.available : null;
-            l.vendor = vendors[l.itemId] || '';
-        }));
+        orders.forEach((o) => {
+            let have = 0;
+            o.lines.forEach((l) => {
+                l.stock = stock[l.itemId] || {};
+                const v = vendors[l.itemId];
+                l.vendor = v ? v.name : '';
+                l.defaultLoc = l.locId || o.hdrLoc || (p.location ? String(p.location) : '');
+                const s = l.stock[l.defaultLoc];
+                l.onHand = s ? s.onHand : null;
+                l.available = s ? s.available : null;
+                if (!l.dropship && l.unreleased > 0) have += Math.min(l.unreleased, Math.max(0, num(l.available)));
+            });
+            o.relReady = have;
+            o.relCommit = have === 0 ? 'none' : (have < o.relUnits ? 'partial' : 'full');
+        });
     }
 
     /* ------------------------------------------------------------------ */
@@ -491,21 +534,22 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
 
     function getBoard() {
         const allowRelease = canRelease();
-        const board = { release: [], ready: [], picked: [], packed: [], shipped: [], excluded: 0, channels: [], canRelease: allowRelease };
+        const board = { release: [], ready: [], picked: [], packed: [], shipped: [], excluded: 0, channels: [], locations: [], canRelease: allowRelease };
         const channels = new Set();
 
         loadOrders().forEach((o) => {
             if (!o.openLines) {
-                if (o.ignoredPos.length) board.excluded++;       // only dropship-with-PO left
+                if (o.ignoredPos.length) board.excluded++;       // only lines with a PO left
                 return;
             }
             if (o.channel) channels.add(o.channel);
             // An order can be in both lists: part released (Ready) and part still to release.
-            if (o.pickUnits > 0 && !o.blocked) board.ready.push(o);
-            if (allowRelease && o.relLines > 0) board.release.push(o);
+            if (!o.pending && o.pickUnits > 0 && !o.blocked) board.ready.push(o);
+            if (allowRelease && (o.relLines > 0 || o.pending)) board.release.push(o);
         });
         attachBins(board.ready);
         if (board.release.length) attachStock(board.release);
+        if (allowRelease) board.locations = getLocations();
 
         loadFulfillments().forEach((f) => {
             if (f.channel) channels.add(f.channel);
@@ -599,9 +643,9 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         if (reason) throw new Error(reason);
     }
 
-    /* ---------- release (line level) ---------- */
+    /* ---------- release (line level, no commitment) ---------- */
 
-    // Current open / committed / released numbers for the selected line of a dynamic SO
+    // Open / released numbers for the selected line of a dynamic SO
     function soLineState(so) {
         const get = (f) => so.getCurrentSublistValue({ sublistId: 'item', fieldId: f });
         const qty = num(get('quantity'));
@@ -609,17 +653,19 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         let pickedQty = ful;
         try { pickedQty = Math.max(ful, Math.abs(num(get('quantitypicked')))); } catch (e) { /* field not on form */ }
         const remaining = Math.max(0, qty - pickedQty);
-        const com = Math.min(Math.max(0, num(get('quantitycommitted')) - (pickedQty - ful)), remaining);
         const rqRaw = get(FLD.releaseQty);
         return {
-            qty, ful, pickedQty, remaining, com, rqSet: hasValue(rqRaw),
+            qty, ful, pickedQty, remaining, rqSet: hasValue(rqRaw),
             rq: Math.min(Math.max(0, num(rqRaw)), remaining),
+            location: String(get('location') || ''),
+            createpo: get('createpo') || '',
             createdpo: get('createdpo'),
+            itemId: get('item'),
             sku: so.getCurrentSublistText({ sublistId: 'item', fieldId: 'item' })
         };
     }
 
-    // Orders released before line-level release: write the implicit released qty onto the lines first.
+    // Orders released before line-level release: write the implicit released qty (whole open qty) onto the lines.
     // Returns true when lines were changed.
     function materializeLegacyRelease(so) {
         if (!isTrue(so.getValue({ fieldId: FLD.released }))) return false;
@@ -631,8 +677,8 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         for (let i = 0; i < n; i++) {
             so.selectLine({ sublistId: 'item', line: i });
             const s = soLineState(so);
-            if (s.createdpo && s.com === 0) { so.cancelLine({ sublistId: 'item' }); continue; }
-            so.setCurrentSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, value: s.com });
+            if (s.createdpo || !s.remaining) { so.cancelLine({ sublistId: 'item' }); continue; }
+            so.setCurrentSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, value: s.remaining });
             so.commitLine({ sublistId: 'item' });
             changed = true;
         }
@@ -640,70 +686,108 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
     }
 
     /**
-     * lines: [{ lineId, releaseQty, createPo }]
-     * releaseQty -> added to custcol_whc_release_qty (must be committed and not yet released)
-     * createPo   -> creates the PO for that line the same way as the native line link
-     *               (line must already be Drop Ship / Special Order with no PO)
+     * payload: { approve: boolean, lines: [{ lineId, location, releaseQty, createPo }] }
+     *   approve    -> Pending Approval -> Pending Fulfillment (orderstatus B)
+     *   location   -> line location (warehouse)
+     *   releaseQty -> added to custcol_whc_release_qty (up to the open, unreleased qty)
+     *   createPo   -> Pending Approval: line set to Drop Ship with the item vendor, NetSuite creates the linked PO on approval
+     *                 Approved: only lines NetSuite already marked Drop Ship / Special Order (Create PO is locked after approval)
      */
-    function releaseLines(soId, lines) {
+    function releaseLines(soId, payload) {
         assertRelease();
+        const body = Array.isArray(payload) ? { approve: false, lines: payload } : (payload || {});
         const id = toIds(soId)[0];
-        const reqs = (lines || [])
-            .map((l) => ({ lineId: String(l.lineId), r: Number(l.releaseQty) || 0, po: l.createPo === true || l.createPo === 'T' }))
-            .filter((x) => x.r !== 0 || x.po);
-        if (!reqs.length) throw new Error('Check at least one line to release or send to a PO.');
+        const reqs = (body.lines || []).map((l) => ({
+            lineId: String(l.lineId),
+            location: l.location ? String(l.location) : '',
+            r: Number(l.releaseQty) || 0,
+            po: l.createPo === true || l.createPo === 'T'
+        }));
         if (reqs.some((x) => x.r < 0)) throw new Error('Quantities must be positive.');
         if (reqs.some((x) => x.r > 0 && x.po)) throw new Error('A line can be released or sent to a PO, not both.');
-        assertOrderAllowed(id, reqs.some((x) => x.r > 0));
+        const releasing = reqs.some((x) => x.r > 0);
+        const anyPo = reqs.some((x) => x.po);
+        assertOrderAllowed(id, releasing);
 
         const so = record.load({ type: record.Type.SALES_ORDER, id, isDynamic: true });
         const tranid = so.getValue({ fieldId: 'tranid' });
+        const pending = so.getValue({ fieldId: 'orderstatus' }) === 'A';
+        if (pending && (releasing || anyPo) && !body.approve) {
+            throw new Error(`${tranid}: set the status to Pending Fulfillment to release lines or create POs.`);
+        }
+        if (!pending && !reqs.length) throw new Error('Nothing to save.');
+
         const legacyChanged = materializeLegacyRelease(so);
-        let released = 0;
-        const poLines = [];
+        let released = 0, changed = legacyChanged;
+        const poLines = [], newPoLines = [];
+        const vendorCache = {};
 
         reqs.forEach((q) => {
             const idx = so.findSublistLineWithValue({ sublistId: 'item', fieldId: 'line', value: q.lineId });
             if (idx < 0) throw new Error(`${tranid}: a line is no longer on the order. Refresh and try again.`);
             so.selectLine({ sublistId: 'item', line: idx });
             const s = soLineState(so);
+            let lineChanged = false;
+
+            if (q.location && q.location !== s.location) {
+                if (s.rq > 0 || s.pickedQty > 0) throw new Error(`${s.sku}: location can't change once qty is released or picked.`);
+                so.setCurrentSublistValue({ sublistId: 'item', fieldId: 'location', value: q.location });
+                lineChanged = true;
+            }
 
             if (q.po) {
-                const createpo = so.getCurrentSublistValue({ sublistId: 'item', fieldId: 'createpo' });
-                so.cancelLine({ sublistId: 'item' });
                 if (s.createdpo) throw new Error(`${s.sku}: this line already has a PO.`);
-                if (createpo !== 'DropShip' && createpo !== 'SpecOrd') {
-                    throw new Error(`${s.sku}: the line is not marked Drop Ship or Special Order. NetSuite only allows that before the order is approved.`);
+                if (pending) {
+                    if (!(s.itemId in vendorCache)) vendorCache[s.itemId] = itemVendor(s.itemId);
+                    const vendor = vendorCache[s.itemId];
+                    if (!vendor) throw new Error(`${s.sku}: no vendor on the item. Add a preferred vendor to create a PO.`);
+                    so.setCurrentSublistValue({ sublistId: 'item', fieldId: 'createpo', value: 'DropShip' });
+                    so.setCurrentSublistValue({ sublistId: 'item', fieldId: 'povendor', value: vendor });
+                    lineChanged = true;
+                    newPoLines.push(q.lineId);
+                } else if (s.createpo !== 'DropShip' && s.createpo !== 'SpecOrd') {
+                    throw new Error(`${s.sku}: Create PO can't be set on an approved order. Only lines NetSuite already marked Drop Ship / Special Order can get a PO.`);
                 }
                 poLines.push(q.lineId);
-                return;
             }
 
-            const unreleased = s.remaining - s.rq;
-            const releasable = Math.max(0, s.com - s.rq);
-            if (q.r > unreleased) throw new Error(`${s.sku}: ${q.r} requested but only ${unreleased} open and not released.`);
-            if (q.r > releasable) throw new Error(`${s.sku}: only ${releasable} committed and not yet released.`);
-            so.setCurrentSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, value: s.rq + q.r });
-            so.commitLine({ sublistId: 'item' });
-            released += q.r;
+            if (q.r > 0) {
+                const unreleased = s.remaining - s.rq;
+                if (q.r > unreleased) throw new Error(`${s.sku}: ${q.r} requested but only ${unreleased} open and not released.`);
+                so.setCurrentSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, value: s.rq + q.r });
+                released += q.r;
+                lineChanged = true;
+            }
+
+            if (lineChanged) { so.commitLine({ sublistId: 'item' }); changed = true; }
+            else so.cancelLine({ sublistId: 'item' });
         });
 
-        if (released > 0 || legacyChanged) {
-            let totalReleased = 0;
-            for (let i = 0; i < so.getLineCount({ sublistId: 'item' }); i++) {
-                totalReleased += num(so.getSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, line: i }));
-            }
-            so.setValue({ fieldId: FLD.released, value: totalReleased > 0 });
-            if (released > 0) {
-                so.setValue({ fieldId: FLD.releasedBy, value: userId() });
-                so.setValue({ fieldId: FLD.releasedOn, value: new Date() });
-            }
-            so.save({ enableSourcing: true, ignoreMandatoryFields: true });
+        let totalReleased = 0;
+        for (let i = 0; i < so.getLineCount({ sublistId: 'item' }); i++) {
+            totalReleased += num(so.getSublistValue({ sublistId: 'item', fieldId: FLD.releaseQty, line: i }));
         }
-        log.audit({ title: 'Release lines', details: { soId: id, tranid, released, poLines, lines: reqs } });
+        so.setValue({ fieldId: FLD.released, value: totalReleased > 0 });
+        if (released > 0) {
+            so.setValue({ fieldId: FLD.releasedBy, value: userId() });
+            so.setValue({ fieldId: FLD.releasedOn, value: new Date() });
+        }
+        if (pending && body.approve) { so.setValue({ fieldId: 'orderstatus', value: 'B' }); changed = true; }
 
-        const result = { soId: id, tranid, released, pos: [], skipped: [] };
-        if (poLines.length) {
+        if (changed) so.save({ enableSourcing: true, ignoreMandatoryFields: true });
+
+        const result = { soId: id, tranid, released, approved: false, pos: [], skipped: [] };
+        if (pending && body.approve) {
+            const st = search.lookupFields({ type: search.Type.SALES_ORDER, id, columns: ['statusref'] }).statusref;
+            const code = Array.isArray(st) ? (st[0] || {}).value : st;
+            result.approved = code !== 'pendingApproval';
+            if (!result.approved) {
+                result.skipped.push({ reason: `${tranid}: saved, but NetSuite kept it Pending Approval. If approval runs through a workflow, approve it there.` });
+            }
+        }
+        log.audit({ title: 'Release lines', details: { soId: id, tranid, approve: !!body.approve, released, poLines, newPoLines } });
+
+        if (poLines.length && (result.approved || !pending)) {
             const po = createLinePOs(id, poLines);
             result.pos = po.pos;
             po.errors.forEach((e) => result.skipped.push({ reason: `${tranid}: ${e}` }));
@@ -712,7 +796,8 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
     }
 
     /**
-     * Creates the PO for the given SO lines, the same as clicking the line link and saving:
+     * Makes sure the given SO lines have their PO. NetSuite normally creates it on approval;
+     * otherwise this does the same as clicking the line link and saving:
      *   purchord.nl?soid=&specord=T|dropship=T&custid=&nexus=&subsidiary=&entity=&poentity=
      * One PO per type + vendor. NetSuite adds every open line of that type and vendor without a PO.
      */
@@ -780,7 +865,7 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         }
     }
 
-    // Bulk: release all committed, unreleased qty on each order (no PO)
+    // Bulk: release all open, unreleased qty on each order (approves Pending Approval orders; no PO)
     function release(soIds) {
         assertRelease();
         const ids = toIds(soIds);
@@ -791,12 +876,13 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
             const blocked = orderBlock(o.id);
             if (blocked) { skipped.push({ id: o.id, tranid: o.tranid, reason: blocked }); return; }
             const lines = o.lines
-                .filter((l) => !l.dropship && l.releasable > 0 && l.unreleased > 0)
-                .map((l) => ({ lineId: l.lineId, releaseQty: Math.min(l.releasable, l.unreleased), createPo: false }));
-            if (!lines.length) { skipped.push({ id: o.id, tranid: o.tranid, reason: `${o.tranid}: nothing committed to release.` }); return; }
+                .filter((l) => !l.dropship && l.unreleased > 0)
+                .map((l) => ({ lineId: l.lineId, releaseQty: l.unreleased, createPo: false }));
+            if (!lines.length) { skipped.push({ id: o.id, tranid: o.tranid, reason: `${o.tranid}: nothing open to release.` }); return; }
             try {
-                const r = releaseLines(o.id, lines);
+                const r = releaseLines(o.id, { approve: o.pending, lines });
                 released.push({ id: o.id, tranid: o.tranid, units: r.released });
+                r.skipped.forEach((s) => skipped.push(s));
             } catch (e) {
                 skipped.push({ id: o.id, tranid: o.tranid, reason: `${o.tranid}: ${e.message}` });
             }
