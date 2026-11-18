@@ -144,6 +144,7 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
             ['address join', `SELECT tsa.addrtext AS x FROM transaction t LEFT JOIN transactionShippingAddress tsa ON tsa.nkey = t.shippingaddress WHERE t.type = 'SalesOrd' AND ROWNUM <= 1`],
             ['itemvendor', `SELECT iv.item AS x FROM itemvendor iv WHERE iv.preferredvendor = 'T' AND ROWNUM <= 1`],
             ['location list', `SELECT id AS x FROM location WHERE NVL(isinactive, 'F') = 'F' AND ROWNUM <= 1`],
+            ['inventoryitemlocations', `SELECT iil.item AS x, iil.location AS l, iil.quantityonhand AS h, iil.quantityavailable AS a FROM inventoryitemlocations iil WHERE ROWNUM <= 1`],
             ['drop ship PO join', `SELECT po.tranid AS x, po.duedate AS d, BUILTIN.DF(po.status) AS st, BUILTIN.DF(po.entity) AS v
                 FROM transaction t JOIN transactionline tl ON tl.transaction = t.id JOIN transaction po ON po.id = tl.createdpo
                 WHERE t.type = 'SalesOrd' AND ROWNUM <= 1`]
@@ -373,9 +374,30 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
     }
 
     // On hand / available per item per location: { itemId: { locId: { onHand, available } } }
+    // Primary source: SuiteQL inventoryitemlocations (same numbers as the item's Locations subtab).
+    // Fallback: item search location columns.
     function getStock(itemIds) {
         const out = {};
         if (!itemIds.length) return out;
+        const put = (item, loc, onHand, available) => {
+            if (!loc) return;
+            if (!out[item]) out[item] = {};
+            out[item][String(loc)] = { onHand: num(onHand), available: num(available) };
+        };
+        try {
+            chunk(itemIds, 900).forEach((ids) => {
+                query.runSuiteQL({
+                    query: `SELECT iil.item AS item_id, iil.location AS loc_id,
+                                   NVL(iil.quantityonhand, 0) AS on_hand, NVL(iil.quantityavailable, 0) AS available
+                            FROM inventoryitemlocations iil
+                            WHERE iil.item IN (${qMarks(ids)})`,
+                    params: ids
+                }).asMappedResults().forEach((r) => put(String(r.item_id), r.loc_id, r.on_hand, r.available));
+            });
+            return out;
+        } catch (e) {
+            log.audit({ title: 'inventoryitemlocations unavailable, using item search', details: e.message });
+        }
         try {
             chunk(itemIds, 500).forEach((ids) => {
                 search.create({
@@ -387,20 +409,34 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
                         search.createColumn({ name: 'locationquantityavailable' })
                     ]
                 }).run().each((r) => {
-                    const loc = r.getValue({ name: 'inventorylocation' });
-                    if (!loc) return true;
-                    if (!out[r.id]) out[r.id] = {};
-                    out[r.id][String(loc)] = {
-                        onHand: num(r.getValue({ name: 'locationquantityonhand' })),
-                        available: num(r.getValue({ name: 'locationquantityavailable' }))
-                    };
+                    put(String(r.id), r.getValue({ name: 'inventorylocation' }),
+                        r.getValue({ name: 'locationquantityonhand' }), r.getValue({ name: 'locationquantityavailable' }));
                     return true;
                 });
             });
         } catch (e) {
-            log.audit({ title: 'Stock lookup unavailable', details: e.message });
+            log.error({ title: 'Stock lookup failed', details: e.message });
         }
         return out;
+    }
+
+    // Debug: compare the console's stock with what the SO lines show (&action=stockcheck&so=<internal id>)
+    function stockCheck(soId) {
+        const id = toIds(soId)[0];
+        const so = record.load({ type: record.Type.SALES_ORDER, id });
+        const lines = [];
+        for (let i = 0; i < so.getLineCount({ sublistId: 'item' }); i++) {
+            const g = (f) => { try { return so.getSublistValue({ sublistId: 'item', fieldId: f, line: i }); } catch (e) { return null; } };
+            lines.push({
+                line: g('line'), itemId: String(g('item')), sku: so.getSublistText({ sublistId: 'item', fieldId: 'item', line: i }),
+                lineLocation: g('location'), soOnHand: g('quantityonhand'), soAvailable: g('quantityavailable')
+            });
+        }
+        const stock = getStock([...new Set(lines.map((l) => l.itemId))]);
+        return {
+            headerLocation: so.getValue({ fieldId: 'location' }),
+            lines: lines.map((l) => Object.assign(l, { consoleByLocation: stock[l.itemId] || {} }))
+        };
     }
 
     function getVendors(itemIds) {
@@ -444,6 +480,13 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
                 l.stock = stock[l.itemId] || {};
                 const v = vendors[l.itemId];
                 l.vendor = v ? v.name : '';
+                // Totals across all locations (shown when the line has no location yet)
+                const all = Object.values(l.stock);
+                l.stock[''] = all.length ? {
+                    onHand: all.reduce((x, v) => x + v.onHand, 0),
+                    available: all.reduce((x, v) => x + v.available, 0)
+                } : undefined;
+                if (!l.stock['']) delete l.stock[''];
                 l.defaultLoc = l.locId || o.hdrLoc || (p.location ? String(p.location) : '');
                 const s = l.stock[l.defaultLoc];
                 l.onHand = s ? s.onHand : null;
@@ -1675,6 +1718,7 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
     return {
         FLD,
         diagnose,
+        stockCheck,
         canRelease,
         getBoard,
         getFulfillmentDetail,
