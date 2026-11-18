@@ -143,7 +143,10 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         const extra = [
             ['address join', `SELECT tsa.addrtext AS x FROM transaction t LEFT JOIN transactionShippingAddress tsa ON tsa.nkey = t.shippingaddress WHERE t.type = 'SalesOrd' AND ROWNUM <= 1`],
             ['itemvendor', `SELECT iv.item AS x FROM itemvendor iv WHERE iv.preferredvendor = 'T' AND ROWNUM <= 1`],
-            ['location list', `SELECT id AS x FROM location WHERE NVL(isinactive, 'F') = 'F' AND ROWNUM <= 1`]
+            ['location list', `SELECT id AS x FROM location WHERE NVL(isinactive, 'F') = 'F' AND ROWNUM <= 1`],
+            ['drop ship PO join', `SELECT po.tranid AS x, po.duedate AS d, BUILTIN.DF(po.status) AS st, BUILTIN.DF(po.entity) AS v
+                FROM transaction t JOIN transactionline tl ON tl.transaction = t.id JOIN transaction po ON po.id = tl.createdpo
+                WHERE t.type = 'SalesOrd' AND ROWNUM <= 1`]
         ];
         const extraRes = extra.map(([expr, q]) => {
             try { query.runSuiteQL({ query: q }); return { src: 'SO', expr, ok: true }; }
@@ -529,12 +532,78 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
     }
 
     /* ------------------------------------------------------------------ */
+    /*  Drop Ship pending delivery (SO lines with a linked PO, not yet delivered) */
+    /* ------------------------------------------------------------------ */
+
+    function loadDropship() {
+        const rows = runSql(`
+            SELECT
+                t.id                                   AS so_id,
+                t.tranid                               AS tranid,
+                t.trandate                             AS trandate,
+                BUILTIN.DF(t.status)                   AS status_text,
+                BUILTIN.DF(t.${FLD.channel})           AS channel,
+                BUILTIN.DF(t.entity)                   AS customer,
+                tl.id                                  AS line_id,
+                i.itemid                               AS sku,
+                NVL(i.displayname, i.itemid)           AS item_name,
+                ABS(tl.quantity)                       AS qty,
+                NVL(tl.quantityshiprecv, 0)            AS delivered,
+                po.id                                  AS po_id,
+                po.tranid                              AS po_num,
+                po.trandate                            AS po_date,
+                po.duedate                             AS po_due,
+                BUILTIN.DF(po.status)                  AS po_status,
+                BUILTIN.DF(po.entity)                  AS vendor,
+                TRUNC(SYSDATE) - po.trandate           AS days_open,
+                CASE WHEN po.duedate < TRUNC(SYSDATE) THEN 'T' ELSE 'F' END AS overdue
+            FROM transaction t
+            JOIN transactionline tl ON tl.transaction = t.id
+            JOIN item i ON i.id = tl.item
+            JOIN transaction po ON po.id = tl.createdpo
+            WHERE t.type = 'SalesOrd'
+              AND t.status IN ('B','D','E')
+              AND tl.mainline = 'F'
+              AND tl.taxline = 'F'
+              AND NVL(tl.isclosed, 'F') = 'F'
+              AND ABS(tl.quantity) - NVL(tl.quantityshiprecv, 0) > 0
+            ORDER BY po.trandate, t.id, tl.linesequencenumber`, []);
+
+        const map = new Map();
+        rows.forEach((r) => {
+            let o = map.get(r.so_id);
+            if (!o) {
+                o = {
+                    id: r.so_id, tranid: r.tranid, date: r.trandate, status: r.status_text,
+                    channel: r.channel || '', customer: r.customer || '',
+                    lines: [], pos: [], vendors: [], units: 0, overdue: false, daysOpen: 0, oldestPo: '', receiveBy: ''
+                };
+                map.set(r.so_id, o);
+            }
+            const qty = num(r.qty), delivered = Math.abs(num(r.delivered));
+            const line = {
+                lineId: r.line_id, sku: r.sku, name: r.item_name, qty, delivered, pending: Math.max(0, qty - delivered),
+                poId: r.po_id, poNum: r.po_num, poDate: r.po_date || '', poDue: r.po_due || '', poStatus: r.po_status || '',
+                vendor: r.vendor || '', daysOpen: num(r.days_open), overdue: isTrue(r.overdue)
+            };
+            o.lines.push(line);
+            o.units += line.pending;
+            if (o.pos.indexOf(line.poNum) < 0) o.pos.push(line.poNum);
+            if (line.vendor && o.vendors.indexOf(line.vendor) < 0) o.vendors.push(line.vendor);
+            if (line.overdue) o.overdue = true;
+            if (line.daysOpen > o.daysOpen) { o.daysOpen = line.daysOpen; o.oldestPo = line.poDate; }
+            if (line.poDue && !o.receiveBy) o.receiveBy = line.poDue;
+        });
+        return [...map.values()];
+    }
+
+    /* ------------------------------------------------------------------ */
     /*  Read API                                                           */
     /* ------------------------------------------------------------------ */
 
     function getBoard() {
         const allowRelease = canRelease();
-        const board = { release: [], ready: [], picked: [], packed: [], shipped: [], excluded: 0, channels: [], locations: [], canRelease: allowRelease };
+        const board = { release: [], dropship: [], ready: [], picked: [], packed: [], shipped: [], excluded: 0, channels: [], locations: [], canRelease: allowRelease };
         const channels = new Set();
 
         loadOrders().forEach((o) => {
@@ -557,6 +626,11 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
             else if (f.shipStatus === SHIP.PACKED) board.packed.push(f);
             else if (f.shipStatus === SHIP.SHIPPED) board.shipped.push(f);
         });
+
+        if (allowRelease) {
+            board.dropship = loadDropship();
+            board.dropship.forEach((o) => { if (o.channel) channels.add(o.channel); });
+        }
 
         board.channels = [...channels].sort();
         return board;
