@@ -688,7 +688,8 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                   '<span>Approving saves the lines; NetSuite creates and links the PO for lines marked Create PO.</span></div>'
                 : '';
             const banner = (r.blocked ? '<div class="whc-banner bad">' + esc(r.blocked) + '. Release is blocked; PO creation is still allowed unless the order is on hold.</div>' : '') +
-                (r.relCommit === 'none' ? '<div class="whc-banner warn">No available stock at the selected locations. Create a PO or release what you have.</div>'
+                (!r.relUnits ? '<div class="whc-banner ok">Nothing left to release on this order.</div>'
+                : r.relCommit === 'none' ? '<div class="whc-banner warn">No available stock at the selected locations. Create a PO or release what you have.</div>'
                 : r.relCommit === 'partial' ? '<div class="whc-banner warn">Partial stock: ' + plural(r.relUnits - r.relReady, 'unit') + ' not available.</div>'
                 : '<div class="whc-banner ok">All open qty is available.</div>');
 
