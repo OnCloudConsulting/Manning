@@ -420,6 +420,51 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         return out;
     }
 
+    /**
+     * Stock for one order, from the same places the SO shows it:
+     *   lines: SO line On Hand / Available (for the line's location, or total when the line has no location)
+     *   items: item record Locations subtab, every location { onHand, available }
+     */
+    function getOrderStock(soId) {
+        const id = toIds(soId)[0];
+        const so = record.load({ type: record.Type.SALES_ORDER, id });
+        const lines = {}, itemIds = new Set();
+        for (let i = 0; i < so.getLineCount({ sublistId: 'item' }); i++) {
+            const g = (f) => { try { return so.getSublistValue({ sublistId: 'item', fieldId: f, line: i }); } catch (e) { return null; } };
+            if (ITEM_TYPES.indexOf(g('itemtype')) < 0) continue;
+            const itemId = String(g('item'));
+            itemIds.add(itemId);
+            lines[String(g('line'))] = {
+                itemId, loc: g('location') ? String(g('location')) : '',
+                onHand: hasValue(g('quantityonhand')) ? num(g('quantityonhand')) : null,
+                available: hasValue(g('quantityavailable')) ? num(g('quantityavailable')) : null
+            };
+        }
+        const items = {};
+        if (itemIds.size) {
+            search.create({ type: search.Type.ITEM, filters: [['internalid', 'anyof', [...itemIds]]], columns: ['internalid'] })
+                .run().each((r) => {
+                    if (usage() < 100) return false;
+                    try {
+                        const rec = record.load({ type: r.recordType, id: r.id });
+                        if (rec.getSublists().indexOf('locations') < 0) return true;
+                        const out = {};
+                        for (let j = 0; j < rec.getLineCount({ sublistId: 'locations' }); j++) {
+                            const v = (f) => { try { return rec.getSublistValue({ sublistId: 'locations', fieldId: f, line: j }); } catch (e) { return null; } };
+                            const loc = v('locationid') || v('location');
+                            if (!loc) continue;
+                            out[String(loc)] = { onHand: num(v('quantityonhand')), available: num(v('quantityavailable')) };
+                        }
+                        items[String(r.id)] = out;
+                    } catch (e) {
+                        log.audit({ title: 'Item locations unavailable for ' + r.id, details: e.message });
+                    }
+                    return true;
+                });
+        }
+        return { lines, items };
+    }
+
     // Debug: compare the console's stock with what the SO lines show (&action=stockcheck&so=<internal id>)
     function stockCheck(soId) {
         const id = toIds(soId)[0];
@@ -1719,6 +1764,7 @@ define(['N/query', 'N/record', 'N/search', 'N/runtime', 'N/render', 'N/url', 'N/
         FLD,
         diagnose,
         stockCheck,
+        getOrderStock,
         canRelease,
         getBoard,
         getFulfillmentDetail,
