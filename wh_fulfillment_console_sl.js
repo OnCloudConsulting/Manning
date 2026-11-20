@@ -79,6 +79,7 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                     case 'data':      return boardWithDiag(res);
                     case 'diag':      return json(res, { ok: true, result: lib.diagnose().filter((d) => !d.ok) });
                     case 'stockcheck': return json(res, { ok: true, result: lib.stockCheck(p.so) });
+                    case 'sostock':   return json(res, { ok: true, result: lib.getOrderStock(p.so) });
                     case 'ifdetail':  return json(res, { ok: true, result: lib.getFulfillmentDetail(p.ifid) });
                     case 'ticketpdf': return res.writeFile({ file: lib.buildPickTickets(p.ids), isInline: true });
                     case 'packslip':  return res.writeFile({ file: lib.packingSlip(p.so, p.if), isInline: true });
@@ -462,6 +463,32 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
             return s || { onHand: null, available: null };
         }
 
+        // Merge stock read from the SO lines and the item Locations subtab into the release lines
+        function applyOrderStock(r, d) {
+            r.lines.forEach((l) => {
+                const it = (d.items || {})[String(l.itemId)];
+                if (it && Object.keys(it).length) {
+                    const all = Object.values(it);
+                    l.stock = Object.assign({}, it, {
+                        '': { onHand: all.reduce((a, v) => a + v.onHand, 0), available: all.reduce((a, v) => a + v.available, 0) }
+                    });
+                }
+                const sl = (d.lines || {})[String(l.lineId)];
+                if (sl && sl.onHand !== null) {
+                    l.stock = l.stock || {};
+                    l.stock[sl.loc] = { onHand: sl.onHand, available: sl.available === null ? sl.onHand : sl.available };
+                }
+            });
+            let have = 0;
+            r.lines.forEach((l) => {
+                if (l.dropship || !(l.unreleased > 0)) return;
+                const av = lineStock(l, l.defaultLoc || '').available;
+                have += Math.min(l.unreleased, Math.max(0, Number(av) || 0));
+            });
+            r.relReady = have;
+            r.relCommit = have === 0 ? 'none' : (have < r.relUnits ? 'partial' : 'full');
+        }
+
         function initRelease(r) {
             S.rel = {}; S.relApprove = !!r.pending;
             r.lines.forEach((l) => {
@@ -627,7 +654,15 @@ define(['N/ui/serverWidget', 'N/runtime', 'N/url', 'N/log', './wh_fulfillment_li
                 S.pick = {};
                 f.row.lines.forEach((l) => { if (!l.dropship && l.committed > 0) S.pick[l.lineId] = { check: false, qty: l.committed }; });
             }
-            if (f.stage === 'release') initRelease(f.row);
+            if (f.stage === 'release') {
+                initRelease(f.row);
+                api('GET', 'sostock', null, '&so=' + encodeURIComponent(f.row.id)).then((d) => {
+                    if (S.drawer !== k) return;
+                    applyOrderStock(f.row, d);
+                    initRelease(f.row);
+                    renderDrawer();
+                }).catch((e) => showError('Could not load stock: ' + e.message));
+            }
             if (!$('whc-overlay').open) $('whc-overlay').showModal();
             renderDrawer();
             if (!ORDER_TABS[f.stage]) {
